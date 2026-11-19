@@ -2,16 +2,36 @@
 // =====================================================================
 // APLIKACJA FADROMY - API (PHP + MySQL)
 //
-//   GET  api.php?action=state               -> słowniki + rejestr pracy
-//   POST api.php?action=save_dictionaries   -> zapis słowników (JSON)
-//   POST api.php?action=save_log            -> dodanie / aktualizacja wpisu
-//   POST api.php?action=delete_log          -> usunięcie wpisu {id}
+// Publiczne (bez logowania):
+//   GET  ?action=session            -> kto jest zalogowany + listy nazw do ekranów logowania
+//   POST ?action=login_operator     -> {operatorId|name, pin} lub {qr: "Imię.Nazwisko#PIN"}
+//   POST ?action=login_web          -> {name, password}
+//   POST ?action=logout             -> {scope: "operator"|"web"|"all"}
+// Wymagają zalogowania (operator lub użytkownik WEB):
+//   GET  ?action=state              -> słowniki (bez PIN-ów i haseł) + rejestr pracy
+//   POST ?action=save_log           -> dodanie / aktualizacja wpisu rejestru
+// Wymagają zalogowania do panelu WEB:
+//   POST ?action=save_dictionaries  -> zapis słowników
+//   POST ?action=delete_log         -> {id}
+//   POST ?action=set_operator_pin   -> {operatorId, pin}
+//   POST ?action=set_web_password   -> {userId, password}
+//   POST ?action=check_operator_pin -> {operatorId, pin} (do wydruku identyfikatora QR)
+//
+// PIN-y i hasła są przechowywane wyłącznie jako hash (password_hash) i nigdy
+// nie są wysyłane do przeglądarki.
 // =====================================================================
 
 declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store, no-cache, must-revalidate');
+header('X-Content-Type-Options: nosniff');
+
+const SCHEMA_VERSION      = 2;
+const MAX_FAILS_ACCOUNT   = 5;    // nieudane próby na konto ...
+const MAX_FAILS_IP        = 30;   // ... i na adres IP (wspólne Wi-Fi w zakładzie!)
+const LOCK_WINDOW_MINUTES = 15;   // w oknie czasowym
+const SESSION_LIFETIME    = 43200; // 12 h
 
 function respond(array $data, int $status = 200): void
 {
@@ -42,7 +62,245 @@ function db(): PDO
     return $pdo;
 }
 
-// ---------- Konwersje dat (ISO 8601 <-> DATETIME w UTC) ----------
+// =====================================================================
+// Migracja bazy (automatyczna): hashowanie PIN-ów i haseł,
+// tabela prób logowania. Wykonuje się raz, przy pierwszym żądaniu.
+// =====================================================================
+
+function isHash(string $v): bool
+{
+    return $v !== '' && !empty(password_get_info($v)['algo']);
+}
+
+function ensureSchema(): void
+{
+    $pdo = db();
+    $ver = $pdo->query("SELECT value FROM settings WHERE name = 'schema_version'")->fetchColumn();
+    if ($ver !== false && (int)$ver >= SCHEMA_VERSION) {
+        return;
+    }
+    if ((int)$pdo->query("SELECT GET_LOCK('fadromy_migrate', 30)")->fetchColumn() !== 1) {
+        throw new RuntimeException('Nie udało się uzyskać blokady migracji');
+    }
+    try {
+        $ver = $pdo->query("SELECT value FROM settings WHERE name = 'schema_version'")->fetchColumn();
+        if ($ver !== false && (int)$ver >= SCHEMA_VERSION) {
+            return;
+        }
+        $pdo->exec('ALTER TABLE operators MODIFY pin VARCHAR(255) NOT NULL DEFAULT \'\'');
+        $pdo->exec('ALTER TABLE web_users MODIFY password VARCHAR(255) NOT NULL DEFAULT \'\'');
+        $pdo->exec('CREATE TABLE IF NOT EXISTS login_attempts (
+            id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            account_key VARCHAR(255)    NOT NULL,
+            ip          VARCHAR(45)     NOT NULL,
+            created_at  TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_account (account_key, created_at),
+            KEY idx_ip (ip, created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+
+        foreach ([['operators', 'pin'], ['web_users', 'password']] as [$table, $col]) {
+            $rows = $pdo->query("SELECT id, `$col` AS secret FROM `$table`")->fetchAll();
+            $upd = $pdo->prepare("UPDATE `$table` SET `$col` = ? WHERE id = ?");
+            foreach ($rows as $r) {
+                $secret = (string)$r['secret'];
+                if ($secret !== '' && !isHash($secret)) {
+                    $upd->execute([password_hash($secret, PASSWORD_DEFAULT), $r['id']]);
+                }
+            }
+        }
+        $pdo->prepare("INSERT INTO settings (name, value) VALUES ('schema_version', ?)
+                       ON DUPLICATE KEY UPDATE value = VALUES(value)")->execute([(string)SCHEMA_VERSION]);
+    } finally {
+        $pdo->query("SELECT RELEASE_LOCK('fadromy_migrate')");
+    }
+}
+
+// =====================================================================
+// Sesja
+// =====================================================================
+
+function startSession(): void
+{
+    $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+    ini_set('session.use_strict_mode', '1');
+    ini_set('session.use_only_cookies', '1');
+    ini_set('session.gc_maxlifetime', (string)SESSION_LIFETIME);
+    session_name('FADROMYSESS');
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path'     => '/',
+        'secure'   => $https,
+        'httponly' => true,
+        'samesite' => 'Strict',
+    ]);
+    session_start();
+
+    $now = time();
+    if (isset($_SESSION['last_seen']) && $now - (int)$_SESSION['last_seen'] > SESSION_LIFETIME) {
+        $_SESSION = [];
+        session_regenerate_id(true);
+    }
+    $_SESSION['last_seen'] = $now;
+}
+
+function publicOperator(array $r): array
+{
+    return ['id' => $r['id'], 'lp' => (int)$r['lp'], 'name' => $r['name']];
+}
+
+function publicWebUser(array $r): array
+{
+    return ['id' => $r['id'], 'lp' => (int)$r['lp'], 'name' => $r['name'], 'role' => $r['role']];
+}
+
+/** Zalogowany operator (sprawdzany w bazie - usunięty z listy = wylogowany). */
+function currentOperator(): ?array
+{
+    static $cache = false;
+    if ($cache !== false) {
+        return $cache;
+    }
+    $cache = null;
+    if (!empty($_SESSION['operator_id'])) {
+        $st = db()->prepare('SELECT id, lp, name FROM operators WHERE id = ?');
+        $st->execute([$_SESSION['operator_id']]);
+        $row = $st->fetch();
+        if ($row) {
+            $cache = publicOperator($row);
+        } else {
+            unset($_SESSION['operator_id']);
+        }
+    }
+    return $cache;
+}
+
+function currentWebUser(): ?array
+{
+    static $cache = false;
+    if ($cache !== false) {
+        return $cache;
+    }
+    $cache = null;
+    if (!empty($_SESSION['web_user_id'])) {
+        $st = db()->prepare('SELECT id, lp, name, role FROM web_users WHERE id = ?');
+        $st->execute([$_SESSION['web_user_id']]);
+        $row = $st->fetch();
+        if ($row) {
+            $cache = publicWebUser($row);
+        } else {
+            unset($_SESSION['web_user_id']);
+        }
+    }
+    return $cache;
+}
+
+function me(): array
+{
+    return ['operator' => currentOperator(), 'webUser' => currentWebUser()];
+}
+
+function requireAnyLogin(): void
+{
+    if (!currentOperator() && !currentWebUser()) {
+        respond(['error' => 'Sesja wygasła - zaloguj się ponownie', 'me' => me()], 401);
+    }
+}
+
+function requireWebLogin(): array
+{
+    $u = currentWebUser();
+    if (!$u) {
+        $status = currentOperator() ? 403 : 401;
+        respond(['error' => 'Wymagane zalogowanie do panelu WEB', 'me' => me()], $status);
+    }
+    return $u;
+}
+
+// =====================================================================
+// Ograniczenie liczby prób logowania
+// =====================================================================
+
+function clientIp(): string
+{
+    return substr((string)($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0'), 0, 45);
+}
+
+function accountKey(string $type, string $value): string
+{
+    return $type . ':' . mb_strtolower(trim($value));
+}
+
+/** Zwraca liczbę minut blokady (0 = można próbować). */
+function lockMinutesLeft(string $accountKey): int
+{
+    $pdo = db();
+    $window = LOCK_WINDOW_MINUTES;
+    $sql = "SELECT COUNT(*) AS n, MIN(created_at) AS first_at FROM login_attempts
+            WHERE %s = ? AND created_at > (UTC_TIMESTAMP() - INTERVAL $window MINUTE)";
+    foreach ([['account_key', $accountKey, MAX_FAILS_ACCOUNT], ['ip', clientIp(), MAX_FAILS_IP]] as [$col, $val, $max]) {
+        $st = $pdo->prepare(sprintf($sql, $col));
+        $st->execute([$val]);
+        $row = $st->fetch();
+        if ((int)$row['n'] >= $max) {
+            $unlockAt = strtotime($row['first_at'] . ' UTC') + $window * 60;
+            return max(1, (int)ceil(($unlockAt - time()) / 60));
+        }
+    }
+    return 0;
+}
+
+function registerFailure(string $accountKey): void
+{
+    $pdo = db();
+    $pdo->prepare('INSERT INTO login_attempts (account_key, ip, created_at) VALUES (?, ?, UTC_TIMESTAMP())')
+        ->execute([$accountKey, clientIp()]);
+    if (random_int(1, 20) === 1) {
+        $pdo->exec('DELETE FROM login_attempts WHERE created_at < (UTC_TIMESTAMP() - INTERVAL 1 DAY)');
+    }
+}
+
+function clearFailures(string $accountKey): void
+{
+    db()->prepare('DELETE FROM login_attempts WHERE account_key = ?')->execute([$accountKey]);
+}
+
+function lockedResponse(int $minutes): void
+{
+    respond(['error' => "Zbyt wiele nieudanych prób logowania. Spróbuj ponownie za $minutes min."], 429);
+}
+
+/** Sprawdza sekret; przy okazji przelicza stary hash, jeśli trzeba. */
+function verifySecret(string $plain, ?string $hash, string $table, string $col, ?string $id): bool
+{
+    static $dummy = null;
+    if ($hash === null || $hash === '' || !isHash($hash)) {
+        // stały czas odpowiedzi także dla nieistniejącego konta
+        $dummy = $dummy ?? password_hash('dummy-secret', PASSWORD_DEFAULT);
+        password_verify($plain, $dummy);
+        return false;
+    }
+    if (!password_verify($plain, $hash)) {
+        return false;
+    }
+    if ($id !== null && password_needs_rehash($hash, PASSWORD_DEFAULT)) {
+        db()->prepare("UPDATE `$table` SET `$col` = ? WHERE id = ?")
+            ->execute([password_hash($plain, PASSWORD_DEFAULT), $id]);
+    }
+    return true;
+}
+
+function findOperatorByName(string $name): ?array
+{
+    $st = db()->prepare('SELECT * FROM operators WHERE LOWER(name) = LOWER(?) ORDER BY sort_order LIMIT 1');
+    $st->execute([trim($name)]);
+    return $st->fetch() ?: null;
+}
+
+// =====================================================================
+// Konwersje dat (ISO 8601 <-> DATETIME w UTC) i pomocnicze
+// =====================================================================
 
 function isoToDb($iso): ?string
 {
@@ -79,27 +337,40 @@ function str($v, int $max = 190): string
     return mb_substr((string)$v, 0, $max);
 }
 
-// ---------- Mapowanie słowników ----------
-// klucz JSON w aplikacji => [tabela, [kolumna_db => [pole_js, typ]]]
+function validNewSecret($v, string $label, int $min): string
+{
+    $s = trim(is_string($v) ? $v : '');
+    if (mb_strlen($s) < $min) {
+        respond(['error' => "$label musi mieć co najmniej $min znaki"], 400);
+    }
+    if (mb_strlen($s) > 128) {
+        respond(['error' => "$label jest za długie"], 400);
+    }
+    return $s;
+}
+
+// =====================================================================
+// Słowniki
+// =====================================================================
+// klucz JSON => [tabela, [kolumna_db => [pole_js, typ]], [kolumna_sekretu, pole_js]|null]
 const DICTIONARIES = [
     'operators' => ['operators', [
-        'id' => ['id', 'str'], 'lp' => ['lp', 'int'], 'name' => ['name', 'str'], 'pin' => ['pin', 'str'],
-    ]],
+        'id' => ['id', 'str'], 'lp' => ['lp', 'int'], 'name' => ['name', 'str'],
+    ], ['pin', 'pin']],
     'machines' => ['machines', [
         'id' => ['id', 'str'], 'name' => ['name', 'str'], 'qr_code' => ['qrCode', 'str'], 'model' => ['model', 'str'],
-    ]],
+    ], null],
     'processes' => ['processes', [
         'id' => ['id', 'str'], 'lp' => ['lp', 'int'], 'name' => ['name', 'str'],
         'register_units' => ['registerUnits', 'bool'], 'unit' => ['unit', 'str'],
-    ]],
+    ], null],
     'webUsers' => ['web_users', [
-        'id' => ['id', 'str'], 'lp' => ['lp', 'int'], 'name' => ['name', 'str'],
-        'password' => ['password', 'str'], 'role' => ['role', 'str'],
-    ]],
+        'id' => ['id', 'str'], 'lp' => ['lp', 'int'], 'name' => ['name', 'str'], 'role' => ['role', 'str'],
+    ], ['password', 'password']],
     'smsManagers' => ['sms_managers', [
         'id' => ['id', 'str'], 'name' => ['name', 'str'], 'phone' => ['phone', 'str'],
         'display_phone' => ['displayPhone', 'str'],
-    ]],
+    ], null],
 ];
 
 function castOut($v, string $type)
@@ -120,6 +391,7 @@ function castIn($v, string $type)
     }
 }
 
+/** Słownik bez kolumn z sekretami. */
 function loadDictionary(string $key): array
 {
     [$table, $cols] = DICTIONARIES[$key];
@@ -135,32 +407,74 @@ function loadDictionary(string $key): array
     return $out;
 }
 
+/**
+ * Zapis słownika: usuwa pozycje, których nie ma na liście, aktualizuje/dodaje pozostałe.
+ * Sekret (PIN/hasło) zmienia się tylko, gdy przysłano nową wartość - jest wtedy hashowany.
+ */
 function saveDictionary(string $key, array $items): void
 {
-    [$table, $cols] = DICTIONARIES[$key];
+    [$table, $cols, $secret] = DICTIONARIES[$key];
     $pdo = db();
-    $pdo->exec("DELETE FROM `$table`");
+
+    $clean = [];
+    foreach (array_values($items) as $item) {
+        if (is_array($item) && !empty($item['id']) && !isset($clean[(string)$item['id']])) {
+            $clean[(string)$item['id']] = $item;
+        }
+    }
+
+    if ($clean) {
+        $ph = implode(',', array_fill(0, count($clean), '?'));
+        $pdo->prepare("DELETE FROM `$table` WHERE id NOT IN ($ph)")->execute(array_map('strval', array_keys($clean)));
+    } else {
+        $pdo->exec("DELETE FROM `$table`");
+    }
+
     $colNames = array_keys($cols);
     $colNames[] = 'sort_order';
-    $sql = sprintf('INSERT INTO `%s` (`%s`) VALUES (%s)',
-        $table, implode('`, `', $colNames), implode(', ', array_fill(0, count($colNames), '?')));
-    $stmt = $pdo->prepare($sql);
-    $seen = [];
-    foreach (array_values($items) as $i => $item) {
-        if (!is_array($item) || empty($item['id']) || isset($seen[(string)$item['id']])) {
-            continue;
+    $insertCols = $colNames;
+    if ($secret) {
+        $insertCols[] = $secret[0];
+    }
+    $updates = [];
+    foreach ($colNames as $c) {
+        if ($c !== 'id') {
+            $updates[] = "`$c` = VALUES(`$c`)";
         }
-        $seen[(string)$item['id']] = true;
+    }
+    $sqlBase = sprintf('INSERT INTO `%s` (`%s`) VALUES (%s) ON DUPLICATE KEY UPDATE %s',
+        $table, implode('`, `', $insertCols), implode(', ', array_fill(0, count($insertCols), '?')),
+        implode(', ', $updates));
+    $stmtKeep = $pdo->prepare($sqlBase);
+    $stmtNewSecret = $secret
+        ? $pdo->prepare($sqlBase . ", `{$secret[0]}` = VALUES(`{$secret[0]}`)")
+        : null;
+
+    $i = 0;
+    foreach ($clean as $item) {
         $values = [];
         foreach ($cols as [$field, $type]) {
             $values[] = castIn($item[$field] ?? null, $type);
         }
-        $values[] = $i;
-        $stmt->execute($values);
+        $values[] = $i++;
+        if ($secret) {
+            $plain = trim(is_string($item[$secret[1]] ?? null) ? $item[$secret[1]] : '');
+            if ($plain !== '') {
+                $values[] = password_hash($plain, PASSWORD_DEFAULT);
+                $stmtNewSecret->execute($values);
+            } else {
+                $values[] = ''; // nowa pozycja bez sekretu = nie można się zalogować
+                $stmtKeep->execute($values);
+            }
+        } else {
+            $stmtKeep->execute($values);
+        }
     }
 }
 
-// ---------- Rejestr pracy ----------
+// =====================================================================
+// Rejestr pracy
+// =====================================================================
 
 function logRowToJson(array $r): array
 {
@@ -197,6 +511,19 @@ function saveLog(array $rec): void
     if ($id === '') {
         respond(['error' => 'Brak identyfikatora wpisu'], 400);
     }
+
+    // Operator bez sesji WEB może zapisywać tylko własne wpisy.
+    if (!currentWebUser()) {
+        $op = currentOperator();
+        $st = db()->prepare('SELECT operator_id FROM work_logs WHERE id = ?');
+        $st->execute([$id]);
+        $existingOwner = $st->fetchColumn();
+        if (($rec['operatorId'] ?? null) !== $op['id']
+            || ($existingOwner !== false && $existingOwner !== $op['id'])) {
+            respond(['error' => 'Brak uprawnień do tego wpisu'], 403);
+        }
+    }
+
     $date = (isset($rec['date']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)$rec['date'])) ? $rec['date'] : null;
     $weightKg = numOrNull($rec['weightKg'] ?? null);
 
@@ -242,7 +569,9 @@ function saveLog(array $rec): void
     ]);
 }
 
-// ---------- Router ----------
+// =====================================================================
+// Router
+// =====================================================================
 
 function readJsonBody(): array
 {
@@ -254,19 +583,108 @@ function readJsonBody(): array
     return $data;
 }
 
-$action = $_GET['action'] ?? '';
+$action = (string)($_GET['action'] ?? '');
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$getActions = ['session', 'state'];
 
-if ($method !== 'GET' && $method !== 'POST') {
-    respond(['error' => 'Metoda niedozwolona'], 405);
+if (in_array($action, $getActions, true)) {
+    if ($method !== 'GET') {
+        respond(['error' => 'Wymagane żądanie GET'], 405);
+    }
+} else {
+    if ($method !== 'POST') {
+        respond(['error' => 'Wymagane żądanie POST'], 405);
+    }
+    // Ochrona CSRF: nagłówka nie da się dodać z obcej strony bez zgody CORS.
+    if (($_SERVER['HTTP_X_FADROMY'] ?? '') !== '1') {
+        respond(['error' => 'Nieprawidłowe żądanie'], 403);
+    }
 }
-if ($action !== 'state' && $method !== 'POST') {
-    respond(['error' => 'Wymagane żądanie POST'], 405);
-}
+
+ensureSchema();
+startSession();
 
 switch ($action) {
+    case 'session':
+        $ops = array_map('publicOperator',
+            db()->query('SELECT id, lp, name FROM operators ORDER BY sort_order, id')->fetchAll());
+        $webs = array_map('publicWebUser',
+            db()->query('SELECT id, lp, name, role FROM web_users ORDER BY sort_order, id')->fetchAll());
+        respond(['me' => me(), 'loginOptions' => ['operators' => $ops, 'webUsers' => $webs]]);
+
+    case 'login_operator':
+        $data = readJsonBody();
+        $row = null;
+        $pin = '';
+        if (isset($data['qr'])) {
+            $parts = explode('#', trim((string)$data['qr']));
+            if (count($parts) !== 2) {
+                respond(['error' => 'Nieprawidłowy format QR operatora (oczekiwano Imię.Nazwisko#Hasło)'], 400);
+            }
+            $name = str_replace('.', ' ', $parts[0]);
+            $pin = trim($parts[1]);
+            $key = accountKey('op', $name);
+            $row = findOperatorByName($name);
+        } else {
+            $pin = trim((string)($data['pin'] ?? ''));
+            if (!empty($data['operatorId'])) {
+                $st = db()->prepare('SELECT * FROM operators WHERE id = ?');
+                $st->execute([(string)$data['operatorId']]);
+                $row = $st->fetch() ?: null;
+                $key = accountKey('op', $row['name'] ?? ('id:' . $data['operatorId']));
+            } else {
+                $name = (string)($data['name'] ?? '');
+                $key = accountKey('op', $name);
+                $row = findOperatorByName($name);
+            }
+        }
+        if ($left = lockMinutesLeft($key)) {
+            lockedResponse($left);
+        }
+        if ($pin === '' || !$row || !verifySecret($pin, $row['pin'], 'operators', 'pin', $row['id'])) {
+            registerFailure($key);
+            respond(['error' => 'Nieprawidłowy operator lub hasło (PIN)!'], 401);
+        }
+        clearFailures($key);
+        session_regenerate_id(true);
+        $_SESSION['operator_id'] = $row['id'];
+        respond(['operator' => publicOperator($row)]);
+
+    case 'login_web':
+        $data = readJsonBody();
+        $name = trim((string)($data['name'] ?? ''));
+        $password = trim((string)($data['password'] ?? ''));
+        $key = accountKey('web', $name);
+        if ($left = lockMinutesLeft($key)) {
+            lockedResponse($left);
+        }
+        $st = db()->prepare('SELECT * FROM web_users WHERE LOWER(name) = LOWER(?) ORDER BY sort_order LIMIT 1');
+        $st->execute([$name]);
+        $row = $st->fetch() ?: null;
+        if ($password === '' || !$row || !verifySecret($password, $row['password'], 'web_users', 'password', $row['id'])) {
+            registerFailure($key);
+            respond(['error' => 'Błędny login lub hasło użytkownika WEB!'], 401);
+        }
+        clearFailures($key);
+        session_regenerate_id(true);
+        $_SESSION['web_user_id'] = $row['id'];
+        respond(['webUser' => publicWebUser($row)]);
+
+    case 'logout':
+        $data = readJsonBody();
+        $scope = (string)($data['scope'] ?? 'all');
+        if ($scope === 'operator' || $scope === 'all') {
+            unset($_SESSION['operator_id']);
+        }
+        if ($scope === 'web' || $scope === 'all') {
+            unset($_SESSION['web_user_id']);
+        }
+        session_regenerate_id(true);
+        respond(['ok' => true]);
+
     case 'state':
-        $state = [];
+        requireAnyLogin();
+        $state = ['me' => me()];
         foreach (array_keys(DICTIONARIES) as $key) {
             $state[$key] = loadDictionary($key);
         }
@@ -276,7 +694,13 @@ switch ($action) {
         $state['logs'] = array_map('logRowToJson', $rows);
         respond($state);
 
+    case 'save_log':
+        requireAnyLogin();
+        saveLog(readJsonBody());
+        respond(['ok' => true]);
+
     case 'save_dictionaries':
+        requireWebLogin();
         $data = readJsonBody();
         $pdo = db();
         $pdo->beginTransaction();
@@ -298,11 +722,8 @@ switch ($action) {
         }
         respond(['ok' => true]);
 
-    case 'save_log':
-        saveLog(readJsonBody());
-        respond(['ok' => true]);
-
     case 'delete_log':
+        requireWebLogin();
         $data = readJsonBody();
         $id = str($data['id'] ?? '', 64);
         if ($id === '') {
@@ -310,6 +731,44 @@ switch ($action) {
         }
         db()->prepare('DELETE FROM work_logs WHERE id = ?')->execute([$id]);
         respond(['ok' => true]);
+
+    case 'set_operator_pin':
+        requireWebLogin();
+        $data = readJsonBody();
+        $pin = validNewSecret($data['pin'] ?? '', 'PIN', 4);
+        $st = db()->prepare('UPDATE operators SET pin = ? WHERE id = ?');
+        $st->execute([password_hash($pin, PASSWORD_DEFAULT), (string)($data['operatorId'] ?? '')]);
+        if ($st->rowCount() === 0) {
+            respond(['error' => 'Nie znaleziono operatora'], 404);
+        }
+        $n = db()->prepare('SELECT name FROM operators WHERE id = ?');
+        $n->execute([(string)$data['operatorId']]);
+        clearFailures(accountKey('op', (string)$n->fetchColumn()));
+        respond(['ok' => true]);
+
+    case 'set_web_password':
+        requireWebLogin();
+        $data = readJsonBody();
+        $password = validNewSecret($data['password'] ?? '', 'Hasło', 6);
+        $st = db()->prepare('UPDATE web_users SET password = ? WHERE id = ?');
+        $st->execute([password_hash($password, PASSWORD_DEFAULT), (string)($data['userId'] ?? '')]);
+        if ($st->rowCount() === 0) {
+            respond(['error' => 'Nie znaleziono użytkownika'], 404);
+        }
+        $n = db()->prepare('SELECT name FROM web_users WHERE id = ?');
+        $n->execute([(string)$data['userId']]);
+        clearFailures(accountKey('web', (string)$n->fetchColumn()));
+        respond(['ok' => true]);
+
+    case 'check_operator_pin':
+        requireWebLogin();
+        $data = readJsonBody();
+        $st = db()->prepare('SELECT * FROM operators WHERE id = ?');
+        $st->execute([(string)($data['operatorId'] ?? '')]);
+        $row = $st->fetch() ?: null;
+        $pin = trim((string)($data['pin'] ?? ''));
+        $ok = $row && $pin !== '' && verifySecret($pin, $row['pin'], 'operators', 'pin', $row['id']);
+        respond(['ok' => $ok]);
 
     default:
         respond(['error' => 'Nieznana akcja'], 400);

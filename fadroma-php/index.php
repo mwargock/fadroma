@@ -268,6 +268,7 @@ $v = @filemtime(__DIR__ . '/assets/app.js') ?: time();
         </script>
         <script src="assets/vendor/react.development.js"></script>
         <script src="assets/vendor/react-dom.development.js"></script>
+        <script src="assets/vendor/qrcode-generator.js"></script>
         <script>window.FADROMY_API_URL = "api.php";</script>
 </head>
 <body class="bg-background text-foreground">
