@@ -42,12 +42,14 @@ dane – odświeżanie co 5 sekund.
 Czas `start_time` / `end_time` zapisywany jest w UTC.
 
 ## Bezpieczeństwo logowania
-- **Logowanie sprawdza serwer.** Po poprawnym PIN-ie / haśle `api.php` zakłada sesję PHP
-  (ciasteczko `HttpOnly`, `SameSite=Strict`, `Secure` przy HTTPS). Bez zalogowania API nie
-  zwraca żadnych danych poza listą nazwisk do ekranu logowania.
+- **Logowanie sprawdza serwer.** Po poprawnym PIN-ie / haśle `api.php` wydaje losowy token sesji,
+  który aplikacja wysyła w nagłówku `X-Fadromy-Token` (w bazie, w tabeli `auth_sessions`, jest tylko
+  jego skrót SHA-256). Sesja wygasa po 12 h bezczynności. Nie są używane ciasteczka ani sesje PHP,
+  więc logowanie działa także w ramce (iframe) osadzonej na innej stronie, np. w Google Sites.
+  Bez zalogowania API nie zwraca żadnych danych poza listą nazwisk do ekranu logowania.
 - **PIN-y i hasła są w bazie tylko jako hash** (`password_hash`) i nigdy nie trafiają do przeglądarki.
   Przy aktualizacji z poprzedniej wersji `api.php` sam zamienia stare wartości na hashe
-  przy pierwszym uruchomieniu (wpis `schema_version = 2` w tabeli `settings`).
+  przy pierwszym uruchomieniu (wpis `schema_version` w tabeli `settings`).
 - **Limit prób:** 5 nieudanych logowań na konto lub 30 z jednego adresu IP w ciągu 15 minut
   blokuje kolejne próby na 15 minut. Ustawienie nowego PIN-u / hasła w panelu zdejmuje blokadę konta.
   Ręczne odblokowanie wszystkich: `DELETE FROM login_attempts;`

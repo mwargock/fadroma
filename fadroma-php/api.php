@@ -27,11 +27,11 @@ header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store, no-cache, must-revalidate');
 header('X-Content-Type-Options: nosniff');
 
-const SCHEMA_VERSION      = 2;
+const SCHEMA_VERSION      = 3;
 const MAX_FAILS_ACCOUNT   = 5;    // nieudane próby na konto ...
 const MAX_FAILS_IP        = 30;   // ... i na adres IP (wspólne Wi-Fi w zakładzie!)
 const LOCK_WINDOW_MINUTES = 15;   // w oknie czasowym
-const SESSION_LIFETIME    = 43200; // 12 h
+const SESSION_LIFETIME    = 43200; // 12 h bezczynności
 
 function respond(array $data, int $status = 200): void
 {
@@ -84,30 +84,23 @@ function ensureSchema(): void
     }
     try {
         $ver = $pdo->query("SELECT value FROM settings WHERE name = 'schema_version'")->fetchColumn();
-        if ($ver !== false && (int)$ver >= SCHEMA_VERSION) {
+        $ver = $ver === false ? 0 : (int)$ver;
+        if ($ver >= SCHEMA_VERSION) {
             return;
         }
-        $pdo->exec('ALTER TABLE operators MODIFY pin VARCHAR(255) NOT NULL DEFAULT \'\'');
-        $pdo->exec('ALTER TABLE web_users MODIFY password VARCHAR(255) NOT NULL DEFAULT \'\'');
-        $pdo->exec('CREATE TABLE IF NOT EXISTS login_attempts (
-            id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-            account_key VARCHAR(255)    NOT NULL,
-            ip          VARCHAR(45)     NOT NULL,
-            created_at  TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            KEY idx_account (account_key, created_at),
-            KEY idx_ip (ip, created_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
-
-        foreach ([['operators', 'pin'], ['web_users', 'password']] as [$table, $col]) {
-            $rows = $pdo->query("SELECT id, `$col` AS secret FROM `$table`")->fetchAll();
-            $upd = $pdo->prepare("UPDATE `$table` SET `$col` = ? WHERE id = ?");
-            foreach ($rows as $r) {
-                $secret = (string)$r['secret'];
-                if ($secret !== '' && !isHash($secret)) {
-                    $upd->execute([password_hash($secret, PASSWORD_DEFAULT), $r['id']]);
-                }
-            }
+        if ($ver < 2) {
+            migrateToV2($pdo);
+        }
+        if ($ver < 3) {
+            $pdo->exec('CREATE TABLE IF NOT EXISTS auth_sessions (
+                token_hash  CHAR(64)    NOT NULL,
+                operator_id VARCHAR(64) NULL,
+                web_user_id VARCHAR(64) NULL,
+                created_at  TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen   TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (token_hash),
+                KEY idx_last_seen (last_seen)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
         }
         $pdo->prepare("INSERT INTO settings (name, value) VALUES ('schema_version', ?)
                        ON DUPLICATE KEY UPDATE value = VALUES(value)")->execute([(string)SCHEMA_VERSION]);
@@ -116,33 +109,106 @@ function ensureSchema(): void
     }
 }
 
+/** v2: PIN-y i hasła jako hash, tabela prób logowania. */
+function migrateToV2(PDO $pdo): void
+{
+    $pdo->exec('ALTER TABLE operators MODIFY pin VARCHAR(255) NOT NULL DEFAULT \'\'');
+    $pdo->exec('ALTER TABLE web_users MODIFY password VARCHAR(255) NOT NULL DEFAULT \'\'');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS login_attempts (
+        id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        account_key VARCHAR(255)    NOT NULL,
+        ip          VARCHAR(45)     NOT NULL,
+        created_at  TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_account (account_key, created_at),
+        KEY idx_ip (ip, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+
+    foreach ([['operators', 'pin'], ['web_users', 'password']] as [$table, $col]) {
+        $rows = $pdo->query("SELECT id, `$col` AS secret FROM `$table`")->fetchAll();
+        $upd = $pdo->prepare("UPDATE `$table` SET `$col` = ? WHERE id = ?");
+        foreach ($rows as $r) {
+            $secret = (string)$r['secret'];
+            if ($secret !== '' && !isHash($secret)) {
+                $upd->execute([password_hash($secret, PASSWORD_DEFAULT), $r['id']]);
+            }
+        }
+    }
+}
+
 // =====================================================================
 // Sesja
 // =====================================================================
 
+// Sesja = losowy token wysyłany przez aplikację w nagłówku X-Fadromy-Token.
+// W bazie zapisany jest tylko jego skrót SHA-256. Nie używamy ciasteczek,
+// więc logowanie działa także, gdy aplikacja jest osadzona w ramce (iframe)
+// na innej stronie, oraz na hostingu z nietrwałymi sesjami PHP.
+
+$AUTH = ['token_hash' => null, 'operator_id' => null, 'web_user_id' => null];
+
 function startSession(): void
 {
-    $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
-    ini_set('session.use_strict_mode', '1');
-    ini_set('session.use_only_cookies', '1');
-    ini_set('session.gc_maxlifetime', (string)SESSION_LIFETIME);
-    session_name('FADROMYSESS');
-    session_set_cookie_params([
-        'lifetime' => 0,
-        'path'     => '/',
-        'secure'   => $https,
-        'httponly' => true,
-        'samesite' => 'Strict',
-    ]);
-    session_start();
-
-    $now = time();
-    if (isset($_SESSION['last_seen']) && $now - (int)$_SESSION['last_seen'] > SESSION_LIFETIME) {
-        $_SESSION = [];
-        session_regenerate_id(true);
+    global $AUTH;
+    $token = (string)($_SERVER['HTTP_X_FADROMY_TOKEN'] ?? '');
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
     }
-    $_SESSION['last_seen'] = $now;
+    $hash = hash('sha256', $token);
+    $st = db()->prepare('SELECT operator_id, web_user_id, TIMESTAMPDIFF(SECOND, last_seen, UTC_TIMESTAMP()) AS idle
+                         FROM auth_sessions WHERE token_hash = ?');
+    $st->execute([$hash]);
+    $row = $st->fetch();
+    if (!$row) {
+        return;
+    }
+    if ((int)$row['idle'] > SESSION_LIFETIME) {
+        db()->prepare('DELETE FROM auth_sessions WHERE token_hash = ?')->execute([$hash]);
+        return;
+    }
+    $AUTH = ['token_hash' => $hash, 'operator_id' => $row['operator_id'], 'web_user_id' => $row['web_user_id']];
+    if ((int)$row['idle'] > 60) {
+        db()->prepare('UPDATE auth_sessions SET last_seen = UTC_TIMESTAMP() WHERE token_hash = ?')->execute([$hash]);
+    }
+}
+
+/** Zapisuje zalogowanie w bieżącej sesji (lub tworzy nową). Zwraca nowy token albo null. */
+function authLogin(string $field, string $id): ?string
+{
+    global $AUTH;
+    $pdo = db();
+    if ($AUTH['token_hash']) {
+        $pdo->prepare("UPDATE auth_sessions SET `$field` = ?, last_seen = UTC_TIMESTAMP() WHERE token_hash = ?")
+            ->execute([$id, $AUTH['token_hash']]);
+        $AUTH[$field] = $id;
+        return null;
+    }
+    $token = bin2hex(random_bytes(32));
+    $hash = hash('sha256', $token);
+    $AUTH = ['token_hash' => $hash, 'operator_id' => null, 'web_user_id' => null];
+    $AUTH[$field] = $id;
+    $pdo->prepare('INSERT INTO auth_sessions (token_hash, operator_id, web_user_id, created_at, last_seen)
+                   VALUES (?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())')
+        ->execute([$hash, $AUTH['operator_id'], $AUTH['web_user_id']]);
+    if (random_int(1, 20) === 1) {
+        $pdo->exec('DELETE FROM auth_sessions WHERE last_seen < (UTC_TIMESTAMP() - INTERVAL ' . SESSION_LIFETIME . ' SECOND)');
+    }
+    return $token;
+}
+
+function authLogout(string $field): void
+{
+    global $AUTH;
+    if (!$AUTH['token_hash']) {
+        return;
+    }
+    $AUTH[$field] = null;
+    if (!$AUTH['operator_id'] && !$AUTH['web_user_id']) {
+        db()->prepare('DELETE FROM auth_sessions WHERE token_hash = ?')->execute([$AUTH['token_hash']]);
+        $AUTH['token_hash'] = null;
+    } else {
+        db()->prepare("UPDATE auth_sessions SET `$field` = NULL WHERE token_hash = ?")->execute([$AUTH['token_hash']]);
+    }
 }
 
 function publicOperator(array $r): array
@@ -163,14 +229,15 @@ function currentOperator(): ?array
         return $cache;
     }
     $cache = null;
-    if (!empty($_SESSION['operator_id'])) {
+    global $AUTH;
+    if (!empty($AUTH['operator_id'])) {
         $st = db()->prepare('SELECT id, lp, name FROM operators WHERE id = ?');
-        $st->execute([$_SESSION['operator_id']]);
+        $st->execute([$AUTH['operator_id']]);
         $row = $st->fetch();
         if ($row) {
             $cache = publicOperator($row);
         } else {
-            unset($_SESSION['operator_id']);
+            authLogout('operator_id');
         }
     }
     return $cache;
@@ -183,14 +250,15 @@ function currentWebUser(): ?array
         return $cache;
     }
     $cache = null;
-    if (!empty($_SESSION['web_user_id'])) {
+    global $AUTH;
+    if (!empty($AUTH['web_user_id'])) {
         $st = db()->prepare('SELECT id, lp, name, role FROM web_users WHERE id = ?');
-        $st->execute([$_SESSION['web_user_id']]);
+        $st->execute([$AUTH['web_user_id']]);
         $row = $st->fetch();
         if ($row) {
             $cache = publicWebUser($row);
         } else {
-            unset($_SESSION['web_user_id']);
+            authLogout('web_user_id');
         }
     }
     return $cache;
@@ -646,9 +714,8 @@ switch ($action) {
             respond(['error' => 'Nieprawidłowy operator lub hasło (PIN)!'], 401);
         }
         clearFailures($key);
-        session_regenerate_id(true);
-        $_SESSION['operator_id'] = $row['id'];
-        respond(['operator' => publicOperator($row)]);
+        $token = authLogin('operator_id', $row['id']);
+        respond(['operator' => publicOperator($row)] + ($token ? ['token' => $token] : []));
 
     case 'login_web':
         $data = readJsonBody();
@@ -666,20 +733,18 @@ switch ($action) {
             respond(['error' => 'Błędny login lub hasło użytkownika WEB!'], 401);
         }
         clearFailures($key);
-        session_regenerate_id(true);
-        $_SESSION['web_user_id'] = $row['id'];
-        respond(['webUser' => publicWebUser($row)]);
+        $token = authLogin('web_user_id', $row['id']);
+        respond(['webUser' => publicWebUser($row)] + ($token ? ['token' => $token] : []));
 
     case 'logout':
         $data = readJsonBody();
         $scope = (string)($data['scope'] ?? 'all');
         if ($scope === 'operator' || $scope === 'all') {
-            unset($_SESSION['operator_id']);
+            authLogout('operator_id');
         }
         if ($scope === 'web' || $scope === 'all') {
-            unset($_SESSION['web_user_id']);
+            authLogout('web_user_id');
         }
-        session_regenerate_id(true);
         respond(['ok' => true]);
 
     case 'state':

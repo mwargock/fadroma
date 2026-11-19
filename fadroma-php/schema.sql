@@ -104,6 +104,17 @@ CREATE TABLE IF NOT EXISTS `login_attempts` (
   KEY `idx_ip` (`ip`, `created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Sesje logowania (token w nagłówku X-Fadromy-Token, w bazie tylko skrót SHA-256)
+CREATE TABLE IF NOT EXISTS `auth_sessions` (
+  `token_hash`  CHAR(64)    NOT NULL,
+  `operator_id` VARCHAR(64) NULL,
+  `web_user_id` VARCHAR(64) NULL,
+  `created_at`  TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `last_seen`   TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`token_hash`),
+  KEY `idx_last_seen` (`last_seen`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- ---------------------------------------------------------------------
 -- Dane startowe (słowniki). INSERT IGNORE - ponowny import nie nadpisze zmian.
 -- PIN-y i hasła zapisane jako hash - wartości startowe są takie same jak w
@@ -176,4 +187,4 @@ INSERT IGNORE INTO `sms_managers` (`id`, `name`, `phone`, `display_phone`, `sort
   ('sms_3', 'Waldemar Stańczak', '+48512544142', '+48 512 544 142', 2),
   ('sms_4', 'Paweł Kozłowski', '+48604116576', '+48 604 116 576', 3);
 
-INSERT IGNORE INTO `settings` (`name`, `value`) VALUES ('webhookUrl', ''), ('schema_version', '2');
+INSERT IGNORE INTO `settings` (`name`, `value`) VALUES ('webhookUrl', ''), ('schema_version', '3');

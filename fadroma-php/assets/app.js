@@ -466,15 +466,37 @@ var App = (() => {
   // ===== Warstwa danych: PHP + MySQL (api.php) =====
   var API_URL = window.FADROMY_API_URL || "api.php";
   var POLL_INTERVAL_MS = 5e3;
+  // Token sesji (bez ciasteczek - dziala takze w ramce iframe na innej stronie).
+  // Trzymany w sessionStorage karty, wiec przetrwa odswiezenie strony.
+  var TOKEN_KEY = "fadromy_token";
+  var authToken = "";
+  try {
+    authToken = window.sessionStorage.getItem(TOKEN_KEY) || "";
+  } catch (e) {
+  }
+  function setAuthToken(token) {
+    authToken = token || "";
+    try {
+      if (authToken)
+        window.sessionStorage.setItem(TOKEN_KEY, authToken);
+      else
+        window.sessionStorage.removeItem(TOKEN_KEY);
+    } catch (e) {
+    }
+  }
   function apiRequest(action, payload) {
-    const opts = payload === void 0 ? { method: "GET", cache: "no-store", credentials: "same-origin" } : {
+    const headers = { "X-Fadromy": "1" };
+    if (authToken)
+      headers["X-Fadromy-Token"] = authToken;
+    const opts = payload === void 0 ? { method: "GET", cache: "no-store", headers } : {
       method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json", "X-Fadromy": "1" },
+      headers: __spreadProps(__spreadValues({}, headers), { "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     };
     return fetch(`${API_URL}?action=${encodeURIComponent(action)}`, opts).then(
       (res) => res.json().catch(() => ({})).then((data) => {
+        if (data && typeof data.token === "string" && data.token)
+          setAuthToken(data.token);
         if (!res.ok || data.error) {
           const err = new Error(data.error || `HTTP ${res.status}`);
           err.status = res.status;
