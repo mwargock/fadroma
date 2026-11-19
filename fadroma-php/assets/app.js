@@ -494,13 +494,28 @@ var App = (() => {
       body: JSON.stringify(payload)
     };
     return fetch(`${API_URL}?action=${encodeURIComponent(action)}`, opts).then(
-      (res) => res.json().catch(() => ({})).then((data) => {
+      (res) => res.text().then((text) => {
+        let data = null;
+        try {
+          data = text ? JSON.parse(text) : {};
+        } catch (e) {
+          data = null;
+        }
+        if (data === null || typeof data !== "object") {
+          const snippet = String(text || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+          const err = new Error(`Nieprawid\u0142owa odpowied\u017A serwera (HTTP ${res.status}): ${snippet || "pusta odpowied\u017A"}`);
+          err.status = res.status;
+          err.data = {};
+          err.serverMessage = true;
+          throw err;
+        }
         if (data && typeof data.token === "string" && data.token)
           setAuthToken(data.token);
         if (!res.ok || data.error) {
           const err = new Error(data.error || `HTTP ${res.status}`);
           err.status = res.status;
           err.data = data;
+          err.serverMessage = !!data.error || res.status >= 400;
           throw err;
         }
         return data;
@@ -655,10 +670,11 @@ var App = (() => {
     const pendingWritesRef = (0, import_react3.useRef)(0);
     const dbErrorShownRef = (0, import_react3.useRef)(false);
     const showToast = (message, type = "info") => {
+      const duration = type === "error" ? 9e3 : 4e3;
       setToast({ message, type, id: Date.now() });
       setTimeout(() => {
-        setToast((prev) => prev && Date.now() - prev.id >= 3900 ? null : prev);
-      }, 4e3);
+        setToast((prev) => prev && Date.now() - prev.id >= duration - 100 ? null : prev);
+      }, duration);
     };
     (0, import_react3.useEffect)(() => {
       const timer = setInterval(() => setNow(/* @__PURE__ */ new Date()), 1e3);
@@ -702,7 +718,10 @@ var App = (() => {
       setCloudConnected(false);
       if (!dbErrorShownRef.current) {
         dbErrorShownRef.current = true;
-        showToast("Brak po\u0142\u0105czenia z baz\u0105 danych MySQL!", "error");
+        showToast(
+          e && e.serverMessage ? `B\u0142\u0105d serwera: ${e.message}` : "Brak po\u0142\u0105czenia z serwerem / baz\u0105 danych MySQL!",
+          "error"
+        );
       }
     };
     const applyLoginOptions = (opts) => {
@@ -876,7 +895,7 @@ var App = (() => {
           showToast(e.message, "error");
         } else {
           setCloudConnected(false);
-          showToast("B\u0142\u0105d zapisu do bazy danych! Sprawd\u017A po\u0142\u0105czenie.", "error");
+          showToast(e.serverMessage ? `B\u0142\u0105d zapisu: ${e.message}` : "B\u0142\u0105d zapisu do bazy danych! Sprawd\u017A po\u0142\u0105czenie.", "error");
         }
         return false;
       } finally {

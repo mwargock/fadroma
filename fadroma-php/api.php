@@ -23,8 +23,14 @@
 
 declare(strict_types=1);
 
+// Ostrzeżenia PHP nie mogą trafić do odpowiedzi - zepsułyby JSON.
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
+ob_start();
+
 header('Content-Type: application/json; charset=utf-8');
-header('Cache-Control: no-store, no-cache, must-revalidate');
+header('Cache-Control: no-store, no-cache, must-revalidate, private');
+header('Pragma: no-cache');
 header('X-Content-Type-Options: nosniff');
 
 const SCHEMA_VERSION      = 3;
@@ -35,14 +41,46 @@ const SESSION_LIFETIME    = 43200; // 12 h bezczynności
 
 function respond(array $data, int $status = 200): void
 {
+    // usuń wszystko, co PHP mogło wypisać wcześniej (ostrzeżenia, BOM z config.php itp.)
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+    $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
+        | (defined('JSON_INVALID_UTF8_SUBSTITUTE') ? JSON_INVALID_UTF8_SUBSTITUTE : 0));
+    if ($json === false) {
+        $status = 500;
+        $json = json_encode(['error' => 'Błąd serwera: nie można zakodować odpowiedzi [JSON ' . json_last_error() . ']']);
+    }
     http_response_code($status);
-    echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION);
+    echo $json;
     exit;
 }
 
+/** Krótki kod błędu do komunikatu - bez haseł i treści zapytań. */
+function errorCode(Throwable $e): string
+{
+    if ($e instanceof PDOException) {
+        $info = $e->errorInfo ?? null;
+        if (is_array($info) && !empty($info[0])) {
+            return 'SQL ' . $info[0] . (isset($info[1]) ? '/' . $info[1] : '');
+        }
+        return 'SQL ' . $e->getCode();
+    }
+    $cls = (new ReflectionClass($e))->getShortName();
+    return $cls . ' @ ' . basename($e->getFile()) . ':' . $e->getLine();
+}
+
 set_exception_handler(function (Throwable $e): void {
-    error_log('[fadromy api] ' . $e->getMessage());
-    respond(['error' => 'Błąd serwera / bazy danych'], 500);
+    error_log('[fadromy api] ' . get_class($e) . ': ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+    respond(['error' => 'Błąd serwera / bazy danych [' . errorCode($e) . ']'], 500);
+});
+
+register_shutdown_function(function (): void {
+    $err = error_get_last();
+    if ($err && in_array($err['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        error_log('[fadromy api] FATAL: ' . $err['message'] . ' @ ' . $err['file'] . ':' . $err['line']);
+        respond(['error' => 'Błąd krytyczny PHP [' . basename($err['file']) . ':' . $err['line'] . ']'], 500);
+    }
 });
 
 function db(): PDO
