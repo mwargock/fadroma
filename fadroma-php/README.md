@@ -41,8 +41,22 @@ dane – odświeżanie co 5 sekund.
 `work_logs` (rejestr: START/STOP, czas, ilości, tony/kg, status, alerty, uwagi).
 Czas `start_time` / `end_time` zapisywany jest w UTC.
 
-## Uwaga dotycząca bezpieczeństwa
-Logowanie (PIN operatora, hasło użytkownika WEB) jest – tak jak w oryginale – sprawdzane
-w przeglądarce, a `api.php` udostępnia listę PIN-ów i haseł każdemu, kto zna adres.
-Aplikację uruchamiaj w sieci firmowej lub zabezpiecz katalog dodatkowo
-(np. hasłem `.htpasswd` lub dostępem tylko z określonych adresów IP).
+## Bezpieczeństwo logowania
+- **Logowanie sprawdza serwer.** Po poprawnym PIN-ie / haśle `api.php` wydaje losowy token sesji,
+  który aplikacja wysyła w nagłówku `X-Fadromy-Token` (w bazie, w tabeli `auth_sessions`, jest tylko
+  jego skrót SHA-256). Sesja wygasa po 12 h bezczynności. Nie są używane ciasteczka ani sesje PHP,
+  więc logowanie działa także w ramce (iframe) osadzonej na innej stronie, np. w Google Sites.
+  Bez zalogowania API nie zwraca żadnych danych poza listą nazwisk do ekranu logowania.
+- **PIN-y i hasła są w bazie tylko jako hash** (`password_hash`) i nigdy nie trafiają do przeglądarki.
+  Przy aktualizacji z poprzedniej wersji `api.php` sam zamienia stare wartości na hashe
+  przy pierwszym uruchomieniu (wpis `schema_version` w tabeli `settings`).
+- **Limit prób:** 5 nieudanych logowań na konto lub 30 z jednego adresu IP w ciągu 15 minut
+  blokuje kolejne próby na 15 minut. Ustawienie nowego PIN-u / hasła w panelu zdejmuje blokadę konta.
+  Ręczne odblokowanie wszystkich: `DELETE FROM login_attempts;`
+- **Uprawnienia:** operator może zapisywać tylko własne wpisy w rejestrze; słowniki, usuwanie
+  wpisów i zmiana PIN-ów/haseł wymagają zalogowania do panelu WEB.
+- PIN-u ani hasła nie da się odczytać – w panelu *Słowniki i Baza* można je tylko ustawić na nowe
+  („Zmień PIN” / „Zmień hasło”). Aby wydrukować identyfikator QR operatora, w zakładce
+  *Kody QR do druku* kliknij kartę operatora i podaj jego PIN. Kody QR są generowane lokalnie.
+- Startowe PIN-y i hasła są takie same jak w poprzedniej wersji – **zmień je** po instalacji.
+- Używaj **HTTPS** – bez niego PIN-y i hasła idą przez sieć otwartym tekstem.

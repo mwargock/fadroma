@@ -466,19 +466,61 @@ var App = (() => {
   // ===== Warstwa danych: PHP + MySQL (api.php) =====
   var API_URL = window.FADROMY_API_URL || "api.php";
   var POLL_INTERVAL_MS = 5e3;
+  // Token sesji (bez ciasteczek - dziala takze w ramce iframe na innej stronie).
+  // Trzymany w sessionStorage karty, wiec przetrwa odswiezenie strony.
+  var TOKEN_KEY = "fadromy_token";
+  var authToken = "";
+  try {
+    authToken = window.sessionStorage.getItem(TOKEN_KEY) || "";
+  } catch (e) {
+  }
+  function setAuthToken(token) {
+    authToken = token || "";
+    try {
+      if (authToken)
+        window.sessionStorage.setItem(TOKEN_KEY, authToken);
+      else
+        window.sessionStorage.removeItem(TOKEN_KEY);
+    } catch (e) {
+    }
+  }
   function apiRequest(action, payload) {
-    const opts = payload === void 0 ? { method: "GET", cache: "no-store" } : {
+    const headers = { "X-Fadromy": "1" };
+    if (authToken)
+      headers["X-Fadromy-Token"] = authToken;
+    const opts = payload === void 0 ? { method: "GET", cache: "no-store", headers } : {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: __spreadProps(__spreadValues({}, headers), { "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     };
     return fetch(`${API_URL}?action=${encodeURIComponent(action)}`, opts).then(
       (res) => res.json().catch(() => ({})).then((data) => {
-        if (!res.ok || data.error)
-          throw new Error(data.error || `HTTP ${res.status}`);
+        if (data && typeof data.token === "string" && data.token)
+          setAuthToken(data.token);
+        if (!res.ok || data.error) {
+          const err = new Error(data.error || `HTTP ${res.status}`);
+          err.status = res.status;
+          err.data = data;
+          throw err;
+        }
         return data;
       })
     );
+  }
+  // Kody QR generowane lokalnie (PIN-y nie trafiaja do zewnetrznych serwisow)
+  function qrImageSrc(text, cellSize) {
+    try {
+      if (typeof qrcode === "function") {
+        qrcode.stringToBytes = qrcode.stringToBytesFuncs["UTF-8"];
+        const qr = qrcode(0, "M");
+        qr.addData(String(text));
+        qr.make();
+        return qr.createDataURL(cellSize || 4, 2);
+      }
+    } catch (e) {
+      console.warn("Blad generowania QR:", e);
+    }
+    return "";
   }
   function calculateShift(dateObj) {
     const h = dateObj.getHours();
@@ -510,7 +552,7 @@ var App = (() => {
   }
   function formatOperatorQrPayload(operator) {
     const normalizedName = operator.name.trim().replace(/\s+/g, ".");
-    return `${normalizedName}#${operator.pin}`;
+    return `${normalizedName}#${operator.pin || "\u2022\u2022\u2022\u2022"}`;
   }
   function QrScannerModal({ isOpen, onClose, onScan, mode, mockItems }) {
     const videoRef = (0, import_react3.useRef)(null);
@@ -577,7 +619,7 @@ var App = (() => {
         type: "text",
         value: manualInput,
         onChange: (e) => setManualInput(e.target.value),
-        placeholder: mode === "operator" ? "np. Sebastian.Kap\u0142oniak#9823" : "np. XC958_1",
+        placeholder: mode === "operator" ? "np. Jan.Kowalski#1234" : "np. XC958_1",
         className: "flex-1 bg-slate-800 border border-slate-600 rounded-xl px-3 py-2.5 text-white font-mono text-sm"
       }
     ), /* @__PURE__ */ import_react3.default.createElement(
@@ -641,35 +683,185 @@ var App = (() => {
         setLogs(fetched);
       }
     };
+    const sessionRef = (0, import_react3.useRef)({ operator: null, webUser: null });
+    const sessionVersionRef = (0, import_react3.useRef)(0);
+    (0, import_react3.useEffect)(() => {
+      sessionRef.current = { operator: currentOperator, webUser: currentWebUser };
+    });
+    const [qrPayloads, setQrPayloads] = (0, import_react3.useState)({});
+    const qrLoginRef = (0, import_react3.useRef)({ busy: false, lastFailed: "", lastFailedAt: 0 });
+    const bumpSession = () => {
+      sessionVersionRef.current += 1;
+    };
+    const markDbOk = () => {
+      setCloudConnected(true);
+      dbErrorShownRef.current = false;
+    };
+    const markDbError = (e) => {
+      console.warn("B\u0142\u0105d komunikacji z baz\u0105 MySQL:", e);
+      setCloudConnected(false);
+      if (!dbErrorShownRef.current) {
+        dbErrorShownRef.current = true;
+        showToast("Brak po\u0142\u0105czenia z baz\u0105 danych MySQL!", "error");
+      }
+    };
+    const applyLoginOptions = (opts) => {
+      if (!opts)
+        return;
+      if (Array.isArray(opts.operators))
+        setOperators(opts.operators);
+      if (Array.isArray(opts.webUsers))
+        setWebUsers(opts.webUsers);
+    };
+    const handleSessionLost = (me) => {
+      const s = sessionRef.current;
+      if (s.operator && !(me && me.operator)) {
+        bumpSession();
+        setCurrentOperator(null);
+        setSelectedMachine(null);
+        setSelectedProcess(null);
+        setActiveLogId(null);
+        setOpStep("machine");
+        setWorkNotes("");
+        showToast("Sesja operatora wygas\u0142a - zaloguj si\u0119 ponownie.", "error");
+      }
+      if (s.webUser && !(me && me.webUser)) {
+        bumpSession();
+        setCurrentWebUser(null);
+        showToast("Sesja panelu WEB wygas\u0142a - zaloguj si\u0119 ponownie.", "error");
+      }
+    };
+    const refreshState = () => apiRequest("state").then((data) => {
+      applyServerState(data);
+      markDbOk();
+      return data;
+    });
     (0, import_react3.useEffect)(() => {
       let cancelled = false;
-      const loadState = () => {
+      apiRequest("session").then((res) => {
+        if (cancelled)
+          return;
+        markDbOk();
+        applyLoginOptions(res.loginOptions);
+        const me = res.me || {};
+        if (me.webUser)
+          setCurrentWebUser(me.webUser);
+        if (me.operator) {
+          refreshState().then((data) => {
+            if (!cancelled)
+              completeOperatorLogin(me.operator, data);
+          }).catch(markDbError);
+        } else if (me.webUser) {
+          refreshState().catch(markDbError);
+        }
+      }).catch((e) => {
+        if (!cancelled)
+          markDbError(e);
+      });
+      const poll = () => {
         if (pendingWritesRef.current > 0)
           return;
-        apiRequest("state").then((data) => {
-          if (cancelled || pendingWritesRef.current > 0)
+        const version = sessionVersionRef.current;
+        const s = sessionRef.current;
+        const loggedIn = !!(s.operator || s.webUser);
+        const req = loggedIn ? apiRequest("state") : apiRequest("session");
+        req.then((data) => {
+          if (cancelled || pendingWritesRef.current > 0 || version !== sessionVersionRef.current)
             return;
-          applyServerState(data);
-          setCloudConnected(true);
-          dbErrorShownRef.current = false;
+          markDbOk();
+          if (loggedIn) {
+            applyServerState(data);
+            handleSessionLost(data.me);
+          } else {
+            applyLoginOptions(data.loginOptions);
+          }
         }).catch((e) => {
-          if (cancelled)
+          if (cancelled || version !== sessionVersionRef.current)
             return;
-          console.warn("Błąd odczytu z bazy MySQL:", e);
-          setCloudConnected(false);
-          if (!dbErrorShownRef.current) {
-            dbErrorShownRef.current = true;
-            showToast("Brak połączenia z bazą danych MySQL!", "error");
+          if (e.status === 401) {
+            markDbOk();
+            handleSessionLost(e.data && e.data.me);
+          } else {
+            markDbError(e);
           }
         });
       };
-      loadState();
-      const timer = setInterval(loadState, POLL_INTERVAL_MS);
+      const timer = setInterval(poll, POLL_INTERVAL_MS);
       return () => {
         cancelled = true;
         clearInterval(timer);
       };
     }, []);
+    const finishOperatorLogin = (op) => __async(this, null, function* () {
+      bumpSession();
+      setCurrentOperator(op);
+      sessionRef.current = __spreadProps(__spreadValues({}, sessionRef.current), { operator: op });
+      let data = null;
+      try {
+        data = yield refreshState();
+      } catch (e) {
+        markDbError(e);
+      }
+      completeOperatorLogin(op, data);
+    });
+    const loginOperatorRequest = (payload) => __async(this, null, function* () {
+      const res = yield apiRequest("login_operator", payload);
+      yield finishOperatorLogin(res.operator);
+    });
+    const handleChangeOperatorPin = (op) => __async(this, null, function* () {
+      const pin = window.prompt(`Nowy PIN dla operatora: ${op.name}
+(minimum 4 znaki)`);
+      if (pin === null)
+        return;
+      if (pin.trim().length < 4) {
+        showToast("PIN musi mie\u0107 co najmniej 4 znaki.", "error");
+        return;
+      }
+      try {
+        yield apiRequest("set_operator_pin", { operatorId: op.id, pin: pin.trim() });
+        setQrPayloads((prev) => {
+          const next = __spreadValues({}, prev);
+          delete next[op.id];
+          return next;
+        });
+        showToast(`Zmieniono PIN operatora: ${op.name}`, "success");
+      } catch (e) {
+        showToast(e.message, "error");
+      }
+    });
+    const handleChangeWebPassword = (u) => __async(this, null, function* () {
+      const pass = window.prompt(`Nowe has\u0142o dla u\u017Cytkownika WEB: ${u.name}
+(minimum 6 znak\xF3w)`);
+      if (pass === null)
+        return;
+      if (pass.trim().length < 6) {
+        showToast("Has\u0142o musi mie\u0107 co najmniej 6 znak\xF3w.", "error");
+        return;
+      }
+      try {
+        yield apiRequest("set_web_password", { userId: u.id, password: pass.trim() });
+        showToast(`Zmieniono has\u0142o: ${u.name}`, "success");
+      } catch (e) {
+        showToast(e.message, "error");
+      }
+    });
+    const handleGenerateOperatorQr = (op) => __async(this, null, function* () {
+      const pin = window.prompt(`Podaj PIN operatora ${op.name}, aby wygenerowa\u0107 identyfikator QR:`);
+      if (pin === null || !pin.trim())
+        return;
+      try {
+        const res = yield apiRequest("check_operator_pin", { operatorId: op.id, pin: pin.trim() });
+        if (!res.ok) {
+          showToast(`Nieprawid\u0142owy PIN operatora ${op.name}.`, "error");
+          return;
+        }
+        setQrPayloads((prev) => __spreadProps(__spreadValues({}, prev), {
+          [op.id]: formatOperatorQrPayload(__spreadProps(__spreadValues({}, op), { pin: pin.trim() }))
+        }));
+      } catch (e) {
+        showToast(e.message, "error");
+      }
+    });
     const runWrite = (action, payload) => __async(this, null, function* () {
       pendingWritesRef.current += 1;
       try {
@@ -677,9 +869,15 @@ var App = (() => {
         setCloudConnected(true);
         return true;
       } catch (e) {
-        console.warn(`Błąd zapisu do bazy MySQL (${action}):`, e);
-        setCloudConnected(false);
-        showToast("Błąd zapisu do bazy danych! Sprawdź połączenie.", "error");
+        console.warn(`B\u0142\u0105d zapisu do bazy MySQL (${action}):`, e);
+        if (e.status === 401) {
+          handleSessionLost(e.data && e.data.me);
+        } else if (e.status === 403 || e.status === 400) {
+          showToast(e.message, "error");
+        } else {
+          setCloudConnected(false);
+          showToast("B\u0142\u0105d zapisu do bazy danych! Sprawd\u017A po\u0142\u0105czenie.", "error");
+        }
         return false;
       } finally {
         pendingWritesRef.current -= 1;
@@ -720,41 +918,46 @@ var App = (() => {
       () => logs.find((l) => l.id === activeLogId && l.status === "W TRAKCIE"),
       [logs, activeLogId]
     );
-    const handleOperatorLogin = (e) => {
+    const handleOperatorLogin = (e) => __async(this, null, function* () {
       e.preventDefault();
-      let found = null;
+      const payload = { pin: loginPinInput.trim() };
       if (loginSelectedOpId) {
-        found = operators.find((o) => o.id === loginSelectedOpId);
+        payload.operatorId = loginSelectedOpId;
       } else if (loginNameInput.trim()) {
-        found = operators.find(
-          (o) => o.name.toLowerCase() === loginNameInput.trim().toLowerCase()
-        );
-      }
-      if (!found) {
+        payload.name = loginNameInput.trim();
+      } else {
         showToast("Wybierz operatora z listy lub wpisz poprawne Imi\u0119 i Nazwisko.", "error");
         return;
       }
-      if (found.pin !== loginPinInput.trim()) {
-        showToast("Nieprawid\u0142owe has\u0142o (PIN) operatora!", "error");
+      if (!payload.pin) {
+        showToast("Wpisz has\u0142o (PIN) operatora!", "error");
         return;
       }
-      completeOperatorLogin(found);
-    };
-    const completeOperatorLogin = (op) => {
+      try {
+        yield loginOperatorRequest(payload);
+      } catch (err) {
+        setLoginPinInput("");
+        showToast(err.message || "Nie uda\u0142o si\u0119 zalogowa\u0107.", "error");
+      }
+    });
+    const completeOperatorLogin = (op, data) => {
+      const srcLogs = data && Array.isArray(data.logs) ? data.logs : logs;
+      const srcMachines = data && Array.isArray(data.machines) ? data.machines : machines;
+      const srcProcesses = data && Array.isArray(data.processes) ? data.processes : processes;
       setCurrentOperator(op);
       setLoginPinInput("");
       setLoginNameInput("");
       setLoginSelectedOpId("");
-      const existingActive = logs.find(
+      const existingActive = srcLogs.find(
         (l) => l.operatorId === op.id && l.status === "W TRAKCIE"
       );
       if (existingActive) {
-        const m = machines.find((x2) => x2.id === existingActive.machineId) || {
+        const m = srcMachines.find((x2) => x2.id === existingActive.machineId) || {
           id: existingActive.machineId,
           name: existingActive.machineName,
           qrCode: existingActive.machineQr
         };
-        const p = processes.find((x2) => x2.id === existingActive.processId) || {
+        const p = srcProcesses.find((x2) => x2.id === existingActive.processId) || {
           id: existingActive.processId,
           name: existingActive.processName,
           registerUnits: false,
@@ -782,17 +985,19 @@ var App = (() => {
           showToast("Nieprawid\u0142owy format QR operatora (oczekiwano Imi\u0119.Nazwisko#Has\u0142o)", "error");
           return;
         }
-        const scannedName = parts[0].replace(/\./g, " ").toLowerCase();
-        const scannedPin = parts[1].trim();
-        const matched = operators.find(
-          (o) => o.name.toLowerCase() === scannedName && o.pin === scannedPin
-        );
-        if (matched) {
+        const guard = qrLoginRef.current;
+        if (guard.busy || guard.lastFailed === clean && Date.now() - guard.lastFailedAt < 1e4)
+          return;
+        guard.busy = true;
+        loginOperatorRequest({ qr: clean }).then(() => {
           setQrModalMode(null);
-          completeOperatorLogin(matched);
-        } else {
-          showToast(`Nie znaleziono operatora lub b\u0142\u0119dne has\u0142o dla kodu: ${clean}`, "error");
-        }
+        }).catch((err) => {
+          guard.lastFailed = clean;
+          guard.lastFailedAt = Date.now();
+          showToast(err.message || "Nie uda\u0142o si\u0119 zalogowa\u0107 kodem QR.", "error");
+        }).finally(() => {
+          guard.busy = false;
+        });
       } else if (qrModalMode === "machine") {
         const matchedMachine = machines.find(
           (m) => m.qrCode.toLowerCase() === clean.toLowerCase() || m.name.toLowerCase() === clean.toLowerCase()
@@ -808,6 +1013,9 @@ var App = (() => {
       }
     };
     const handleOperatorLogout = () => {
+      bumpSession();
+      apiRequest("logout", { scope: "operator" }).catch(() => {
+      });
       setCurrentOperator(null);
       setSelectedMachine(null);
       setSelectedProcess(null);
@@ -1282,10 +1490,7 @@ var App = (() => {
           mode: qrModalMode,
           onClose: () => setQrModalMode(null),
           onScan: handleQrScanResult,
-          mockItems: qrModalMode === "operator" ? operators.map((o) => ({
-            label: o.name,
-            payload: formatOperatorQrPayload(o)
-          })) : machines.map((m) => ({
+          mockItems: qrModalMode === "operator" ? [] : machines.map((m) => ({
             label: m.name,
             payload: m.qrCode
           }))
@@ -1540,18 +1745,25 @@ var App = (() => {
         ")"
       ) : /* @__PURE__ */ import_react3.default.createElement("div", { className: "text-center text-xs text-slate-500" }, "APLIKACJA FADROMY \u2022 Tryb Operatora Android / PWA")));
     }
-    const handleWebLogin = (e) => {
+    const handleWebLogin = (e) => __async(this, null, function* () {
       e.preventDefault();
-      const matched = webUsers.find(
-        (u) => u.name.toLowerCase() === webLoginName.trim().toLowerCase() && u.password === webLoginPass.trim()
-      );
-      if (!matched) {
-        showToast("B\u0142\u0119dny login lub has\u0142o u\u017Cytkownika WEB!", "error");
+      if (!webLoginName.trim() || !webLoginPass.trim()) {
+        showToast("Wybierz u\u017Cytkownika i wpisz has\u0142o.", "error");
         return;
       }
-      setCurrentWebUser(matched);
-      showToast(`Witaj w Panelu WEB, ${matched.name}!`, "success");
-    };
+      try {
+        const res = yield apiRequest("login_web", { name: webLoginName.trim(), password: webLoginPass.trim() });
+        bumpSession();
+        setWebLoginPass("");
+        setCurrentWebUser(res.webUser);
+        sessionRef.current = __spreadProps(__spreadValues({}, sessionRef.current), { webUser: res.webUser });
+        showToast(`Witaj w Panelu WEB, ${res.webUser.name}!`, "success");
+        refreshState().catch(markDbError);
+      } catch (err) {
+        setWebLoginPass("");
+        showToast(err.message || "B\u0142\u0119dny login lub has\u0142o u\u017Cytkownika WEB!", "error");
+      }
+    });
     if (!currentWebUser) {
       return /* @__PURE__ */ import_react3.default.createElement("div", { className: "min-h-screen bg-slate-100 text-slate-900 flex flex-col items-center justify-center p-4" }, toast && /* @__PURE__ */ import_react3.default.createElement("div", { className: "fixed top-4 right-4 z-50 bg-slate-900 text-white px-4 py-3 rounded-xl shadow-xl text-sm font-bold" }, toast.message), /* @__PURE__ */ import_react3.default.createElement("div", { className: "bg-white border border-slate-200 rounded-3xl shadow-xl max-w-md w-full p-8" }, /* @__PURE__ */ import_react3.default.createElement("div", { className: "flex items-center justify-between mb-6" }, /* @__PURE__ */ import_react3.default.createElement(
         "button",
@@ -1647,6 +1859,9 @@ var App = (() => {
       "button",
       {
         onClick: () => {
+          bumpSession();
+          apiRequest("logout", { scope: "web" }).catch(() => {
+          });
           setCurrentWebUser(null);
           setAppMode("landing");
         },
@@ -1909,7 +2124,7 @@ var App = (() => {
         /* @__PURE__ */ import_react3.default.createElement(Plus, { className: "w-4 h-4" }),
         " Dodaj operatora"
       )
-    ), /* @__PURE__ */ import_react3.default.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ import_react3.default.createElement("table", { className: "w-full text-left text-sm border-collapse" }, /* @__PURE__ */ import_react3.default.createElement("thead", null, /* @__PURE__ */ import_react3.default.createElement("tr", { className: "bg-slate-100 text-xs uppercase text-slate-600" }, /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "LP"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "U\u017Cytkownik (Operator)"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "Has\u0142o (PIN)"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "Ci\u0105g kodu QR"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5 text-right" }, "Akcje"))), /* @__PURE__ */ import_react3.default.createElement("tbody", { className: "divide-y divide-slate-200" }, operators.map((op) => /* @__PURE__ */ import_react3.default.createElement("tr", { key: op.id }, /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-bold" }, op.lp), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-semibold" }, op.name), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-mono" }, op.pin), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-mono text-xs text-amber-700" }, formatOperatorQrPayload(op)), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 text-right" }, /* @__PURE__ */ import_react3.default.createElement(
+    ), /* @__PURE__ */ import_react3.default.createElement("div", { className: "overflow-x-auto" }, /* @__PURE__ */ import_react3.default.createElement("table", { className: "w-full text-left text-sm border-collapse" }, /* @__PURE__ */ import_react3.default.createElement("thead", null, /* @__PURE__ */ import_react3.default.createElement("tr", { className: "bg-slate-100 text-xs uppercase text-slate-600" }, /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "LP"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "U\u017Cytkownik (Operator)"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "Has\u0142o (PIN)"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "Ci\u0105g kodu QR"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5 text-right" }, "Akcje"))), /* @__PURE__ */ import_react3.default.createElement("tbody", { className: "divide-y divide-slate-200" }, operators.map((op) => /* @__PURE__ */ import_react3.default.createElement("tr", { key: op.id }, /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-bold" }, op.lp), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-semibold" }, op.name), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-mono whitespace-nowrap" }, "\u2022\u2022\u2022\u2022", import_react3.default.createElement("button", { type: "button", onClick: () => handleChangeOperatorPin(op), className: "ml-2 text-xs font-sans font-bold text-blue-600 hover:underline bg-transparent" }, "Zmie\u0144 PIN")), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-mono text-xs text-amber-700" }, formatOperatorQrPayload(op)), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 text-right" }, /* @__PURE__ */ import_react3.default.createElement(
       "button",
       {
         onClick: () => {
@@ -2147,7 +2362,7 @@ var App = (() => {
         /* @__PURE__ */ import_react3.default.createElement(Plus, { className: "w-4 h-4" }),
         " Dodaj u\u017Cytkownika WEB"
       )
-    ), /* @__PURE__ */ import_react3.default.createElement("table", { className: "w-full text-left text-sm border-collapse" }, /* @__PURE__ */ import_react3.default.createElement("thead", null, /* @__PURE__ */ import_react3.default.createElement("tr", { className: "bg-slate-100 text-xs uppercase text-slate-600" }, /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "LP"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "U\u017Cytkownik"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "Has\u0142o"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5 text-right" }, "Akcje"))), /* @__PURE__ */ import_react3.default.createElement("tbody", { className: "divide-y divide-slate-200" }, webUsers.map((u) => /* @__PURE__ */ import_react3.default.createElement("tr", { key: u.id }, /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-bold" }, u.lp), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-semibold" }, u.name), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-mono" }, u.password), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 text-right" }, /* @__PURE__ */ import_react3.default.createElement(
+    ), /* @__PURE__ */ import_react3.default.createElement("table", { className: "w-full text-left text-sm border-collapse" }, /* @__PURE__ */ import_react3.default.createElement("thead", null, /* @__PURE__ */ import_react3.default.createElement("tr", { className: "bg-slate-100 text-xs uppercase text-slate-600" }, /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "LP"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "U\u017Cytkownik"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5" }, "Has\u0142o"), /* @__PURE__ */ import_react3.default.createElement("th", { className: "p-2.5 text-right" }, "Akcje"))), /* @__PURE__ */ import_react3.default.createElement("tbody", { className: "divide-y divide-slate-200" }, webUsers.map((u) => /* @__PURE__ */ import_react3.default.createElement("tr", { key: u.id }, /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-bold" }, u.lp), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-semibold" }, u.name), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 font-mono whitespace-nowrap" }, "\u2022\u2022\u2022\u2022\u2022\u2022", import_react3.default.createElement("button", { type: "button", onClick: () => handleChangeWebPassword(u), className: "ml-2 text-xs font-sans font-bold text-blue-600 hover:underline bg-transparent" }, "Zmie\u0144 has\u0142o")), /* @__PURE__ */ import_react3.default.createElement("td", { className: "p-2.5 text-right" }, /* @__PURE__ */ import_react3.default.createElement(
       "button",
       {
         onClick: () => {
@@ -2258,35 +2473,39 @@ var App = (() => {
       /* @__PURE__ */ import_react3.default.createElement(
         "img",
         {
-          src: `https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(
-            m.qrCode
-          )}`,
+          src: qrImageSrc(m.qrCode, 5),
           alt: m.qrCode,
           className: "w-36 h-36 mb-3 border border-slate-300 bg-white p-1.5 rounded-xl"
         }
       ),
       /* @__PURE__ */ import_react3.default.createElement("div", { className: "font-black text-sm text-slate-900" }, m.name),
       /* @__PURE__ */ import_react3.default.createElement("div", { className: "font-mono text-xs font-bold text-amber-700 mt-1 bg-amber-100 px-2 py-0.5 rounded" }, m.qrCode)
-    )))), /* @__PURE__ */ import_react3.default.createElement("div", { className: "bg-white border border-slate-200 rounded-2xl p-5 shadow-sm" }, /* @__PURE__ */ import_react3.default.createElement("h3", { className: "text-base font-black uppercase text-slate-700 mb-4 border-b pb-2" }, "2. Identyfikatory QR Operator\xF3w (Model: Imi\u0119.Nazwisko#Has\u0142o)"), /* @__PURE__ */ import_react3.default.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4" }, operators.map((op) => {
-      const payload = formatOperatorQrPayload(op);
+    )))), /* @__PURE__ */ import_react3.default.createElement("div", { className: "bg-white border border-slate-200 rounded-2xl p-5 shadow-sm" }, /* @__PURE__ */ import_react3.default.createElement("h3", { className: "text-base font-black uppercase text-slate-700 mb-4 border-b pb-2" }, "2. Identyfikatory QR Operator\xF3w (Model: Imi\u0119.Nazwisko#Has\u0142o)"), /* @__PURE__ */ import_react3.default.createElement("p", { className: "text-xs text-slate-500 -mt-2 mb-4 print:hidden" }, "PIN-y s\u0105 przechowywane w bazie w formie zaszyfrowanej. Aby wydrukowa\u0107 identyfikator, kliknij kart\u0119 operatora i podaj jego PIN."), /* @__PURE__ */ import_react3.default.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4" }, operators.map((op) => {
+      const payload = qrPayloads[op.id] || "";
       return /* @__PURE__ */ import_react3.default.createElement(
         "div",
         {
           key: op.id,
           className: "border border-slate-300 rounded-2xl p-3.5 flex flex-col items-center text-center"
         },
-        /* @__PURE__ */ import_react3.default.createElement(
+        payload ? /* @__PURE__ */ import_react3.default.createElement(
           "img",
           {
-            src: `https://api.qrserver.com/v1/create-qr-code/?size=140x140&data=${encodeURIComponent(
-              payload
-            )}`,
-            alt: payload,
+            src: qrImageSrc(payload, 4),
+            alt: "QR " + op.name,
             className: "w-32 h-32 mb-2.5 border border-slate-200 p-1 rounded-xl"
           }
+        ) : /* @__PURE__ */ import_react3.default.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => handleGenerateOperatorQr(op),
+            className: "w-32 h-32 mb-2.5 border-2 border-dashed border-slate-300 rounded-xl text-xs font-bold text-slate-500 hover:border-amber-500 hover:text-amber-700 bg-white p-2 print:hidden"
+          },
+          "Generuj QR (podaj PIN)"
         ),
         /* @__PURE__ */ import_react3.default.createElement("div", { className: "font-black text-xs sm:text-sm text-slate-900" }, op.lp, ". ", op.name),
-        /* @__PURE__ */ import_react3.default.createElement("div", { className: "font-mono text-[11px] text-slate-500 mt-0.5 break-all" }, payload)
+        /* @__PURE__ */ import_react3.default.createElement("div", { className: "font-mono text-[11px] text-slate-500 mt-0.5 break-all" }, formatOperatorQrPayload(op))
       );
     }))))));
   }
