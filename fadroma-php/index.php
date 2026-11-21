@@ -2,6 +2,9 @@
 // APLIKACJA FADROMY - System Ewidencji Ładowarek
 // Frontend (React) korzystający z bazy MySQL przez api.php
 header('Content-Type: text/html; charset=utf-8');
+// Strona zawsze świeża - po aktualizacji przeglądarka pobierze nowy app.js
+header('Cache-Control: no-cache, no-store, must-revalidate');
+header('Pragma: no-cache');
 $v = @filemtime(__DIR__ . '/assets/app.js') ?: time();
 ?><!DOCTYPE html>
 <html lang="pl">

@@ -115,6 +115,23 @@ CREATE TABLE IF NOT EXISTS `auth_sessions` (
   KEY `idx_last_seen` (`last_seen`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Historia wysłanych SMS-ów (SMSAPI)
+CREATE TABLE IF NOT EXISTS `sms_log` (
+  `id`          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `created_at`  TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `kind`        VARCHAR(16)     NOT NULL DEFAULT 'alert',
+  `operator_id` VARCHAR(64)     NULL,
+  `web_user_id` VARCHAR(64)     NULL,
+  `recipients`  TEXT            NULL,
+  `message`     TEXT            NULL,
+  `ok`          TINYINT(1)      NOT NULL DEFAULT 0,
+  `sent_count`  INT             NOT NULL DEFAULT 0,
+  `response`    TEXT            NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_kind_created` (`kind`, `created_at`),
+  KEY `idx_operator` (`operator_id`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- ---------------------------------------------------------------------
 -- Dane startowe (słowniki). INSERT IGNORE - ponowny import nie nadpisze zmian.
 -- PIN-y i hasła zapisane jako hash - wartości startowe są takie same jak w
@@ -187,4 +204,4 @@ INSERT IGNORE INTO `sms_managers` (`id`, `name`, `phone`, `display_phone`, `sort
   ('sms_3', 'Waldemar Stańczak', '+48512544142', '+48 512 544 142', 2),
   ('sms_4', 'Paweł Kozłowski', '+48604116576', '+48 604 116 576', 3);
 
-INSERT IGNORE INTO `settings` (`name`, `value`) VALUES ('webhookUrl', ''), ('schema_version', '3');
+INSERT IGNORE INTO `settings` (`name`, `value`) VALUES ('webhookUrl', ''), ('schema_version', '4');
