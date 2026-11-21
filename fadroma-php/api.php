@@ -33,7 +33,9 @@ header('Cache-Control: no-store, no-cache, must-revalidate, private');
 header('Pragma: no-cache');
 header('X-Content-Type-Options: nosniff');
 
-const SCHEMA_VERSION      = 3;
+const SCHEMA_VERSION      = 4;
+const SMS_ALERT_COOLDOWN  = 60;   // s - jeden alert SMS na operatora na minutę
+const SMS_TEST_COOLDOWN   = 30;   // s - testowy SMS z panelu
 const MAX_FAILS_ACCOUNT   = 5;    // nieudane próby na konto ...
 const MAX_FAILS_IP        = 30;   // ... i na adres IP (wspólne Wi-Fi w zakładzie!)
 const LOCK_WINDOW_MINUTES = 15;   // w oknie czasowym
@@ -139,6 +141,9 @@ function ensureSchema(): void
                 PRIMARY KEY (token_hash),
                 KEY idx_last_seen (last_seen)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+        }
+        if ($ver < 4) {
+            $pdo->exec(SMS_LOG_DDL);
         }
         $pdo->prepare("INSERT INTO settings (name, value) VALUES ('schema_version', ?)
                        ON DUPLICATE KEY UPDATE value = VALUES(value)")->execute([(string)SCHEMA_VERSION]);
@@ -675,6 +680,172 @@ function saveLog(array $rec): void
     ]);
 }
 
+
+// =====================================================================
+// SMS przez SMSAPI.pl (wysyłane z serwera - token nie trafia do przeglądarki)
+// =====================================================================
+
+const SMS_LOG_DDL = 'CREATE TABLE IF NOT EXISTS sms_log (
+    id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    created_at   TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    kind         VARCHAR(16)     NOT NULL DEFAULT \'alert\',
+    operator_id  VARCHAR(64)     NULL,
+    web_user_id  VARCHAR(64)     NULL,
+    recipients   TEXT            NULL,
+    message      TEXT            NULL,
+    ok           TINYINT(1)      NOT NULL DEFAULT 0,
+    sent_count   INT             NOT NULL DEFAULT 0,
+    response     TEXT            NULL,
+    PRIMARY KEY (id),
+    KEY idx_kind_created (kind, created_at),
+    KEY idx_operator (operator_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci';
+
+function smsConfig(): array
+{
+    $c = require __DIR__ . '/config.php';
+    return [
+        'token'     => trim((string)($c['smsapi_token'] ?? '')),
+        'from'      => trim((string)($c['smsapi_from'] ?? '')),
+        'normalize' => !empty($c['smsapi_normalize']),
+        'test'      => !empty($c['smsapi_test']),
+        'url'       => (string)($c['smsapi_url'] ?? 'https://api.smsapi.pl/sms.do'),
+    ];
+}
+
+/** Numer do formatu SMSAPI: same cyfry, z kierunkowym (domyślnie 48). */
+function normalizePhone(string $phone): ?string
+{
+    $digits = preg_replace('/\D+/', '', $phone);
+    if (strpos(trim($phone), '00') === 0) {
+        $digits = substr($digits, 2);
+    }
+    if (strlen($digits) === 9) {
+        $digits = '48' . $digits;
+    }
+    return (strlen($digits) >= 10 && strlen($digits) <= 15) ? $digits : null;
+}
+
+function httpPostForm(string $url, array $fields, array $headers): array
+{
+    $body = http_build_query($fields);
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $body,
+            CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_TIMEOUT        => 15,
+        ]);
+        $resp = curl_exec($ch);
+        $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err = $resp === false ? curl_error($ch) : '';
+        curl_close($ch);
+        return [$status, $resp === false ? '' : (string)$resp, $err];
+    }
+    $ctx = stream_context_create(['http' => [
+        'method'        => 'POST',
+        'header'        => implode("\r\n", array_merge($headers, ['Content-Type: application/x-www-form-urlencoded'])),
+        'content'       => $body,
+        'timeout'       => 15,
+        'ignore_errors' => true,
+    ]]);
+    $resp = @file_get_contents($url, false, $ctx);
+    $status = 0;
+    foreach ($http_response_header ?? [] as $h) {
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#', $h, $m)) {
+            $status = (int)$m[1];
+        }
+    }
+    return [$status, $resp === false ? '' : (string)$resp, $resp === false ? 'brak połączenia z SMSAPI' : ''];
+}
+
+/**
+ * Wysyła SMS do listy numerów. Zwraca ['ok' => bool, 'sent' => int, 'error' => string].
+ * Każda wysyłka jest zapisywana w tabeli sms_log.
+ */
+function sendSms(array $phones, string $message, string $kind): array
+{
+    $cfg = smsConfig();
+    $numbers = array_values(array_unique(array_filter(array_map('normalizePhone', $phones))));
+    $result = ['ok' => false, 'sent' => 0, 'error' => ''];
+    $raw = '';
+
+    if ($cfg['token'] === '') {
+        $result['error'] = 'SMSAPI nie jest skonfigurowane (brak tokenu w config.php)';
+    } elseif (!$numbers) {
+        $result['error'] = 'Brak poprawnych numerów odbiorców';
+    } else {
+        $fields = [
+            'to'       => implode(',', $numbers),
+            'message'  => $message,
+            'format'   => 'json',
+            'encoding' => 'utf-8',
+        ];
+        if ($cfg['from'] !== '') {
+            $fields['from'] = $cfg['from'];
+        }
+        if ($cfg['normalize']) {
+            $fields['normalize'] = '1';
+        }
+        if ($cfg['test']) {
+            $fields['test'] = '1';
+        }
+        [$status, $raw, $netErr] = httpPostForm($cfg['url'], $fields, [
+            'Authorization: Bearer ' . $cfg['token'],
+            'Accept: application/json',
+        ]);
+        $json = json_decode($raw, true);
+        if ($netErr !== '') {
+            $result['error'] = 'Brak połączenia z SMSAPI: ' . $netErr;
+        } elseif (is_array($json) && isset($json['error'])) {
+            $result['error'] = 'SMSAPI: ' . ($json['message'] ?? 'błąd') . ' (kod ' . $json['error'] . ')';
+        } elseif (is_array($json) && isset($json['count'])) {
+            $result['ok'] = true;
+            $result['sent'] = (int)$json['count'];
+        } else {
+            $result['error'] = 'Nieoczekiwana odpowiedź SMSAPI (HTTP ' . $status . ')';
+        }
+    }
+
+    global $AUTH;
+    db()->prepare('INSERT INTO sms_log (created_at, kind, operator_id, web_user_id, recipients, message, ok, sent_count, response)
+                   VALUES (UTC_TIMESTAMP(), ?, ?, ?, ?, ?, ?, ?, ?)')
+        ->execute([
+            $kind,
+            $AUTH['operator_id'] ?? null,
+            $AUTH['web_user_id'] ?? null,
+            implode(',', $numbers),
+            $message,
+            $result['ok'] ? 1 : 0,
+            $result['sent'],
+            mb_substr($result['error'] !== '' ? $result['error'] . ' | ' . $raw : $raw, 0, 4000),
+        ]);
+    return $result;
+}
+
+/** Sekundy od ostatniego udanego SMS danego rodzaju (dla operatora lub całego systemu). */
+function secondsSinceLastSms(string $kind, ?string $operatorId): ?int
+{
+    $sql = 'SELECT TIMESTAMPDIFF(SECOND, MAX(created_at), UTC_TIMESTAMP()) FROM sms_log WHERE kind = ? AND ok = 1';
+    $params = [$kind];
+    if ($operatorId !== null) {
+        $sql .= ' AND operator_id = ?';
+        $params[] = $operatorId;
+    }
+    $st = db()->prepare($sql);
+    $st->execute($params);
+    $v = $st->fetchColumn();
+    return $v === null || $v === false ? null : (int)$v;
+}
+
+function managerPhones(): array
+{
+    return db()->query('SELECT phone FROM sms_managers ORDER BY sort_order, id')->fetchAll(PDO::FETCH_COLUMN);
+}
+
 // =====================================================================
 // Router
 // =====================================================================
@@ -793,6 +964,8 @@ switch ($action) {
         }
         $webhook = db()->query("SELECT value FROM settings WHERE name = 'webhookUrl'")->fetchColumn();
         $state['webhookUrl'] = $webhook === false ? '' : (string)$webhook;
+        $smsCfg = smsConfig();
+        $state['smsapi'] = ['configured' => $smsCfg['token'] !== '', 'test' => $smsCfg['test']];
         $rows = db()->query('SELECT * FROM work_logs ORDER BY start_time DESC')->fetchAll();
         $state['logs'] = array_map('logRowToJson', $rows);
         respond($state);
@@ -872,6 +1045,48 @@ switch ($action) {
         $pin = trim((string)($data['pin'] ?? ''));
         $ok = $row && $pin !== '' && verifySecret($pin, $row['pin'], 'operators', 'pin', $row['id']);
         respond(['ok' => $ok]);
+
+    case 'send_alert':
+        // Alert pomocy od operatora - SMS do wszystkich kierowników z listy.
+        requireAnyLogin();
+        $op = currentOperator();
+        if (!$op) {
+            respond(['error' => 'Alert może wysłać tylko zalogowany operator'], 403);
+        }
+        if (smsConfig()['token'] === '') {
+            respond(['ok' => false, 'configured' => false]);
+        }
+        $since = secondsSinceLastSms('alert', $op['id']);
+        if ($since !== null && $since < SMS_ALERT_COOLDOWN) {
+            respond(['ok' => true, 'configured' => true, 'throttled' => true, 'sent' => 0,
+                     'info' => 'SMS wysłano przed chwilą - kolejny możliwy za ' . (SMS_ALERT_COOLDOWN - $since) . ' s']);
+        }
+        $data = readJsonBody();
+        $process = str($data['process'] ?? '', 120);
+        $machine = str($data['machine'] ?? '', 120);
+        $time = preg_match('/^\d{2}:\d{2}(:\d{2})?$/', (string)($data['time'] ?? '')) ? (string)$data['time']
+            : (new DateTime('now', new DateTimeZone('Europe/Warsaw')))->format('H:i');
+        $message = sprintf('%s, %s (%s), %s - UWAGA POMOC', $op['name'], $process ?: 'brak procesu', $machine ?: 'brak maszyny', $time);
+        $res = sendSms(managerPhones(), $message, 'alert');
+        respond(['ok' => $res['ok'], 'configured' => true, 'sent' => $res['sent']]
+            + ($res['ok'] ? [] : ['smsError' => $res['error']]));
+
+    case 'sms_test':
+        requireWebLogin();
+        $data = readJsonBody();
+        $phone = normalizePhone((string)($data['phone'] ?? ''));
+        if (!$phone) {
+            respond(['error' => 'Podaj poprawny numer telefonu'], 400);
+        }
+        $since = secondsSinceLastSms('test', null);
+        if ($since !== null && $since < SMS_TEST_COOLDOWN) {
+            respond(['error' => 'Odczekaj ' . (SMS_TEST_COOLDOWN - $since) . ' s przed kolejnym testem'], 429);
+        }
+        $res = sendSms([$phone], 'Test SMS - APLIKACJA FADROMY. Alerty SMS dzialaja poprawnie.', 'test');
+        if (!$res['ok']) {
+            respond(['error' => $res['error']], 502);
+        }
+        respond(['ok' => true, 'sent' => $res['sent']]);
 
     default:
         respond(['error' => 'Nieznana akcja'], 400);

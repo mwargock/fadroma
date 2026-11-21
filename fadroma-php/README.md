@@ -26,6 +26,22 @@ dane – odświeżanie co 5 sekund.
 
 > Skaner kodów QR (kamera telefonu) działa tylko przez **HTTPS** (lub na `localhost`).
 
+## SMS-y przez SMSAPI.pl
+Po wciśnięciu **ALERT** przez operatora serwer sam wysyła SMS do wszystkich osób z listy
+*Słowniki i Baza → Alerty SMS / Integracje*. Przycisk „Wyślij SMS z telefonu” zostaje jako zapas.
+
+1. W `config.php` **na serwerze** wpisz token: `'smsapi_token' => 'TWÓJ_TOKEN',`
+   (token z panelu SMSAPI: *Ustawienia API → Tokeny API*, z uprawnieniem do wysyłki SMS).
+   Tokenu nie zapisuj w repozytorium – trafia tylko do pliku na serwerze i nigdy do przeglądarki.
+2. Opcjonalnie `smsapi_from` – zatwierdzona w SMSAPI nazwa nadawcy (np. `Fadromy`).
+3. `smsapi_normalize => true` (domyślnie) zamienia polskie znaki na łacińskie – SMS mieści 160
+   znaków zamiast 70, więc alert zwykle kosztuje 1 SMS zamiast 2.
+4. `smsapi_test => true` – tryb testowy SMSAPI (nic nie wychodzi i nic nie kosztuje).
+5. Sprawdź w panelu: *Alerty SMS / Integracje → Wyślij testowy SMS*.
+
+Ograniczenia: 1 alert SMS na operatora na minutę, 1 testowy SMS na 30 s.
+Każda wysyłka (także nieudana, z odpowiedzią SMSAPI) jest zapisywana w tabeli `sms_log`.
+
 ## Struktura
 | Plik | Opis |
 |------|------|

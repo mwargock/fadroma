@@ -680,7 +680,12 @@ var App = (() => {
       const timer = setInterval(() => setNow(/* @__PURE__ */ new Date()), 1e3);
       return () => clearInterval(timer);
     }, []);
+    const [smsapiInfo, setSmsapiInfo] = (0, import_react3.useState)({ configured: false, test: false });
+    const [smsTestPhone, setSmsTestPhone] = (0, import_react3.useState)("");
+    const [smsTestBusy, setSmsTestBusy] = (0, import_react3.useState)(false);
     const applyServerState = (data) => {
+      if (data.smsapi && typeof data.smsapi === "object")
+        setSmsapiInfo(data.smsapi);
       if (Array.isArray(data.operators))
         setOperators(data.operators);
       if (Array.isArray(data.machines))
@@ -1227,7 +1232,24 @@ var App = (() => {
         smsText,
         timeStr,
         procName,
-        machName
+        machName,
+        smsStatus: "sending",
+        smsInfo: "Wysy\u0142anie SMS do kierownik\xF3w..."
+      });
+      const updateSms = (smsStatus, smsInfo) => setAlertModalData(
+        (prev) => prev && prev.timeStr === timeStr ? __spreadProps(__spreadValues({}, prev), { smsStatus, smsInfo }) : prev
+      );
+      apiRequest("send_alert", { process: procName, machine: machName, time: timeStr }).then((res) => {
+        if (!res.configured)
+          updateSms("off", "");
+        else if (res.throttled)
+          updateSms("sent", res.info);
+        else if (res.ok)
+          updateSms("sent", `SMS wys\u0142any automatycznie do ${res.sent} odbiorc\xF3w.`);
+        else
+          updateSms("error", `Automatyczny SMS nie zosta\u0142 wys\u0142any: ${res.smsError}`);
+      }).catch((e) => {
+        updateSms("error", `Automatyczny SMS nie zosta\u0142 wys\u0142any: ${e.message}`);
       });
     });
     const [currentWebUser, setCurrentWebUser] = (0, import_react3.useState)(null);
@@ -1514,7 +1536,7 @@ var App = (() => {
             payload: m.qrCode
           }))
         }
-      ), alertModalData && /* @__PURE__ */ import_react3.default.createElement("div", { className: "fixed inset-0 z-50 bg-red-950/95 flex items-center justify-center p-4" }, /* @__PURE__ */ import_react3.default.createElement("div", { className: "bg-slate-900 border-4 border-red-500 rounded-3xl max-w-md w-full p-6 text-center shadow-2xl" }, /* @__PURE__ */ import_react3.default.createElement("div", { className: "w-20 h-20 rounded-full bg-red-600 text-white flex items-center justify-center mx-auto mb-4 animate-ping" }, /* @__PURE__ */ import_react3.default.createElement(TriangleAlert, { className: "w-10 h-10" })), /* @__PURE__ */ import_react3.default.createElement("h2", { className: "text-2xl font-black text-red-400 mb-2" }, "ALERT ZAREJESTROWANY W SYSTEMIE!"), /* @__PURE__ */ import_react3.default.createElement("p", { className: "text-slate-300 text-sm mb-4" }, "Tw\xF3j wiersz w Panelu WEB pulsuje na czerwono dla nadzoru."), /* @__PURE__ */ import_react3.default.createElement("div", { className: "bg-slate-950 border border-slate-700 rounded-xl p-3 text-left mb-5" }, /* @__PURE__ */ import_react3.default.createElement("div", { className: "text-xs text-slate-400 uppercase mb-1" }, "Tre\u015B\u0107 komunikatu SMS:"), /* @__PURE__ */ import_react3.default.createElement("div", { className: "font-mono text-sm text-amber-300 font-bold" }, alertModalData.smsText), /* @__PURE__ */ import_react3.default.createElement("div", { className: "text-xs text-slate-400 mt-2" }, "Odbiorcy (", smsManagers.length, "): ", smsManagers.map((m) => m.name).join(", "))), /* @__PURE__ */ import_react3.default.createElement(
+      ), alertModalData && /* @__PURE__ */ import_react3.default.createElement("div", { className: "fixed inset-0 z-50 bg-red-950/95 flex items-center justify-center p-4" }, /* @__PURE__ */ import_react3.default.createElement("div", { className: "bg-slate-900 border-4 border-red-500 rounded-3xl max-w-md w-full p-6 text-center shadow-2xl" }, /* @__PURE__ */ import_react3.default.createElement("div", { className: "w-20 h-20 rounded-full bg-red-600 text-white flex items-center justify-center mx-auto mb-4 animate-ping" }, /* @__PURE__ */ import_react3.default.createElement(TriangleAlert, { className: "w-10 h-10" })), /* @__PURE__ */ import_react3.default.createElement("h2", { className: "text-2xl font-black text-red-400 mb-2" }, "ALERT ZAREJESTROWANY W SYSTEMIE!"), /* @__PURE__ */ import_react3.default.createElement("p", { className: "text-slate-300 text-sm mb-4" }, "Tw\xF3j wiersz w Panelu WEB pulsuje na czerwono dla nadzoru."), /* @__PURE__ */ import_react3.default.createElement("div", { className: "bg-slate-950 border border-slate-700 rounded-xl p-3 text-left mb-5" }, /* @__PURE__ */ import_react3.default.createElement("div", { className: "text-xs text-slate-400 uppercase mb-1" }, "Tre\u015B\u0107 komunikatu SMS:"), /* @__PURE__ */ import_react3.default.createElement("div", { className: "font-mono text-sm text-amber-300 font-bold" }, alertModalData.smsText), /* @__PURE__ */ import_react3.default.createElement("div", { className: "text-xs text-slate-400 mt-2" }, "Odbiorcy (", smsManagers.length, "): ", smsManagers.map((m) => m.name).join(", "), alertModalData.smsStatus && alertModalData.smsStatus !== "off" && /* @__PURE__ */ import_react3.default.createElement("div", { className: `mt-3 rounded-xl px-3 py-2 text-sm font-bold ${alertModalData.smsStatus === "sent" ? "bg-emerald-900/60 text-emerald-200 border border-emerald-600" : alertModalData.smsStatus === "error" ? "bg-red-900/60 text-red-100 border border-red-500" : "bg-slate-800 text-slate-200 border border-slate-600"}` }, alertModalData.smsStatus === "sent" ? "\u2714 " : alertModalData.smsStatus === "error" ? "\u26A0 " : "\u23F3 ", alertModalData.smsInfo))), /* @__PURE__ */ import_react3.default.createElement(
         "a",
         {
           href: `sms:${smsManagers.map((m) => m.phone).join(",")}?body=${encodeURIComponent(
@@ -2456,7 +2478,35 @@ var App = (() => {
         className: "p-1.5 text-red-600 hover:bg-red-50 rounded-lg"
       },
       /* @__PURE__ */ import_react3.default.createElement(Trash2, { className: "w-4 h-4" })
-    )))))), /* @__PURE__ */ import_react3.default.createElement("div", { className: "bg-blue-50 border border-blue-200 rounded-2xl p-4 space-y-2" }, /* @__PURE__ */ import_react3.default.createElement("div", { className: "font-bold text-sm text-blue-900" }, "Opcjonalny darmowy Webhook bramki SMS (Google Apps Script / Android SMS Gateway):"), /* @__PURE__ */ import_react3.default.createElement("p", { className: "text-xs text-blue-800" }, "Domy\u015Blnie operator na telefonie Android wysy\u0142a darmowy SMS bezpo\u015Brednio z karty SIM jednym klikni\u0119ciem. Je\u015Bli chcesz dodatkowo wysy\u0142a\u0107 \u017C\u0105danie HTTP POST w tle, wklej adres URL webhooka poni\u017Cej:"), /* @__PURE__ */ import_react3.default.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ import_react3.default.createElement(
+    )))))), /* @__PURE__ */ import_react3.default.createElement("div", { className: `border rounded-2xl p-4 space-y-3 ${smsapiInfo.configured ? "bg-emerald-50 border-emerald-200" : "bg-amber-50 border-amber-200"}` }, /* @__PURE__ */ import_react3.default.createElement("div", { className: "font-bold text-sm text-slate-900" }, "SMSAPI.pl \u2014 automatyczne SMS-y przy ALERCIE POMOCY"), /* @__PURE__ */ import_react3.default.createElement("p", { className: "text-xs text-slate-700" }, smsapiInfo.configured ? `Status: SKONFIGUROWANE${smsapiInfo.test ? " (TRYB TESTOWY \u2014 SMS-y nie s\u0105 faktycznie wysy\u0142ane)" : ""}. Po wci\u015Bni\u0119ciu ALERT przez operatora serwer sam wy\u015Ble SMS do wszystkich os\xF3b z listy powy\u017Cej (maks. 1 SMS na operatora na minut\u0119).` : "Status: NIESKONFIGUROWANE. Wpisz token SMSAPI w pliku config.php na serwerze (smsapi_token). Do tego czasu operator wysy\u0142a SMS r\u0119cznie z telefonu."), smsapiInfo.configured && /* @__PURE__ */ import_react3.default.createElement("form", {
+      onSubmit: (e) => __async(this, null, function* () {
+        e.preventDefault();
+        if (!smsTestPhone.trim()) {
+          showToast("Podaj numer telefonu do testu.", "error");
+          return;
+        }
+        setSmsTestBusy(true);
+        try {
+          yield apiRequest("sms_test", { phone: smsTestPhone.trim() });
+          showToast(smsapiInfo.test ? "Test OK (tryb testowy SMSAPI \u2014 SMS nie zosta\u0142 faktycznie wys\u0142any)." : "Testowy SMS wys\u0142any!", "success");
+        } catch (err) {
+          showToast(err.message, "error");
+        } finally {
+          setSmsTestBusy(false);
+        }
+      }),
+      className: "flex flex-wrap gap-2"
+    }, /* @__PURE__ */ import_react3.default.createElement("input", {
+      type: "tel",
+      value: smsTestPhone,
+      onChange: (e) => setSmsTestPhone(e.target.value),
+      placeholder: "Numer do testu, np. 600 100 200",
+      className: "flex-1 min-w-[200px] bg-white border border-slate-300 rounded-xl px-3 py-2 text-sm"
+    }), /* @__PURE__ */ import_react3.default.createElement("button", {
+      type: "submit",
+      disabled: smsTestBusy,
+      className: "px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl disabled:opacity-50"
+    }, smsTestBusy ? "Wysy\u0142anie..." : "Wy\u015Blij testowy SMS"))), /* @__PURE__ */ import_react3.default.createElement("div", { className: "bg-blue-50 border border-blue-200 rounded-2xl p-4 space-y-2" }, /* @__PURE__ */ import_react3.default.createElement("div", { className: "font-bold text-sm text-blue-900" }, "Opcjonalny darmowy Webhook bramki SMS (Google Apps Script / Android SMS Gateway):"), /* @__PURE__ */ import_react3.default.createElement("p", { className: "text-xs text-blue-800" }, "Domy\u015Blnie operator na telefonie Android wysy\u0142a darmowy SMS bezpo\u015Brednio z karty SIM jednym klikni\u0119ciem. Je\u015Bli chcesz dodatkowo wysy\u0142a\u0107 \u017C\u0105danie HTTP POST w tle, wklej adres URL webhooka poni\u017Cej:"), /* @__PURE__ */ import_react3.default.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ import_react3.default.createElement(
       "input",
       {
         type: "url",
